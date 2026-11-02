@@ -1,5 +1,7 @@
 # Fable 2 Return to Albion — Interface Moderna v1 (teclado e mouse)
 
+🇬🇧 [Read in English](README.md)
+
 Mod para a DLL do launcher do **Refii** (Fable 2 Return to Albion). Deixa os menus mais
 confortáveis no teclado e mouse e mais rápidos, sem mudar a arte original do jogo.
 

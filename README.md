@@ -1,66 +1,56 @@
-# Fable 2 Return to Albion — Interface Moderna v1 (teclado e mouse)
+# Fable 2 Return to Albion — Modern UI v1 (keyboard & mouse)
 
-Mod para a DLL do launcher do **Refii** (Fable 2 Return to Albion). Deixa os menus mais
-confortáveis no teclado e mouse e mais rápidos, sem mudar a arte original do jogo.
+🇧🇷 [Leia em português](LEIA-ME.md)
 
-Vídeo: veja `Fable 2 - interface moderna v1.mp4`.
+A replacement launcher DLL for **Refii** (Fable 2 Return to Albion). Makes the menus nicer and
+faster on keyboard and mouse without changing the game's original art.
 
-## O que muda
+## What changes
 
-- **Destaque ao passar o mouse** — a linha sob o mouse fica branca, cresce um pouco e desliza,
-  sem roubar a seleção do teclado.
-- **"Esc Voltar" clicável** — acende com o mouse em cima; clicar volta, igual ao Esc.
-- **Home / End** — pulam para o começo/fim das listas.
-- **Aro de seleção no teclado/mouse** — o aro dourado original aparece também fora do controle,
-  mostrando a tecla certa (E) em vez do botão A.
-- **"(Equipado)" / "(Equipped)"** — marca a arma e a roupa em uso nas listas.
-- **Ponteiro de manopla** — troca a seta do Windows por uma manopla, ajustada à resolução.
-  Variações de cor em `ponteiro/variacoes/`.
-- **Roda social** — Q aperta abre, aperta fecha (não precisa segurar); escolhe com o mouse.
-- **Menus mais rápidos** — listas e menu principal abrem sem os travões de antes; materiais do
-  mundo copiados sem ida ao render thread.
-- **Textos do menu de pausa** — "Sair para a área de trabalho", "Salvar e sair para a tela de
-  título" etc. aparecem em português **só** se a tradução PT-BR estiver instalada; em inglês o
-  jogo continua em inglês.
+- **Mouse hover highlight** — the row under the mouse turns white, grows slightly and slides,
+  without stealing the keyboard selection.
+- **Clickable "Esc Back"** — lights up on hover; clicking goes back, same as Esc.
+- **Home / End** jump to the top/bottom of lists.
+- **Selection ring on keyboard/mouse** — the original gold ring also shows outside gamepad mode,
+  with the right key (E) instead of the A button.
+- **"(Equipped)"** marks the weapon and clothing you are using.
+- **Gauntlet pointer** replaces the Windows arrow, scaled to the resolution. Colour variants in
+  `ponteiro/variacoes/`.
+- **Social wheel** — press Q to open, press again to close (no holding); pick with the mouse.
+- **Faster menus** — lists and the main menu open without the old hitches.
+- Host-only menu texts show in Portuguese only when the PT-BR translation is installed.
 
-## Instalação
+## Install
 
-1. **Feche o jogo.**
-2. Vá em `Fable 2 Return to Albion\data_refii-launcher_windows_x86_64\`.
-3. **Faça backup** de `refii-launcher.dll` e `refii-launcher.pdb` (ex.: renomeie para `.original`).
-4. Copie `dll\refii-launcher.dll` e `dll\refii-launcher.pdb` para essa pasta.
-5. Copie `ponteiro\refii_cursor.png` e `ponteiro\refii_cursor_hotspot.txt` para a pasta do
-   executável do jogo (onde fica `Fable 2 Return to Albion.exe`).
+1. **Close the game.**
+2. Open `Fable 2 Return to Albion\data_refii-launcher_windows_x86_64\`.
+3. **Back up** `refii-launcher.dll` and `refii-launcher.pdb`.
+4. Copy `dll\refii-launcher.dll` and `dll\refii-launcher.pdb` there.
+5. Copy `ponteiro\refii_cursor.png` and `ponteiro\refii_cursor_hotspot.txt` next to the game exe.
 
-Para trocar a cor da manopla, copie um arquivo de `ponteiro\variacoes\` por cima de
-`refii_cursor.png` (mantendo esse nome).
+## Turn parts off
 
-## Desligar partes (sem desinstalar)
+Create an empty file next to the game exe:
 
-Crie um arquivo vazio com o nome abaixo na pasta do executável:
-
-| Arquivo | Desliga |
+| File | Turns off |
 |---|---|
-| `refii_hover_off.flag` | destaque do mouse e o "Esc Voltar" clicável |
-| `refii_cursor_off.flag` | a manopla (volta a seta do Windows) |
-| `refii_equipped_tag_off.flag` | o "(Equipado)" |
-| `refii_wheel_hold.flag` | roda social volta a ser "segurar Q" |
-| `refii_kbm_cursor_off.flag` | o aro de seleção no teclado/mouse |
+| `refii_hover_off.flag` | hover highlight and clickable Esc Back |
+| `refii_cursor_off.flag` | gauntlet pointer |
+| `refii_equipped_tag_off.flag` | "(Equipped)" suffix |
+| `refii_wheel_hold.flag` | social wheel back to hold-Q |
+| `refii_kbm_cursor_off.flag` | selection ring on keyboard/mouse |
 
-## Desinstalar
+## Uninstall
 
-Feche o jogo e devolva os dois arquivos do backup. Apague `refii_cursor.png` e
-`refii_cursor_hotspot.txt` se quiser.
+Close the game and restore the two backed-up files.
 
-## Compatibilidade
+## Notes
 
-- Feito sobre a mesma versão do Refii que acompanha o Return to Albion atual. Se o seu Refii for
-  de outra versão, **não use** esta DLL (ela substitui o launcher inteiro).
-- Não mexe em saves nem no `refii.toml`.
-- Funciona com ou sem a tradução PT-BR.
+- Built against the Refii version shipped with the current Return to Albion. Do not use it with
+  a different Refii version — it replaces the whole launcher.
+- Does not touch saves or `refii.toml`.
 
-## Créditos
+## Credits
 
-- Refii (recompilação do Fable 2) — seus autores.
-- Manopla: "gauntlet cursor", OpenGameArt.org, domínio público (CC0).
-- Código-fonte das mudanças em `codigo/` (patch + arquivos alterados).
+- Refii — its authors. Gauntlet: "gauntlet cursor", OpenGameArt.org, CC0.
+- Source of the changes in `codigo/` (patch + changed files).
