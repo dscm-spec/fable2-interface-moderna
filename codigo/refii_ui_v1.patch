@@ -1,0 +1,2432 @@
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/gdb/Engine_GameGdb.cs refii_ui_11_hover/sdk/src/Engine/gdb/Engine_GameGdb.cs
+--- refii_build_orig/sdk/src/Engine/gdb/Engine_GameGdb.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/gdb/Engine_GameGdb.cs	2026-11-01 19:44:31.283254900 -0400
+@@ -180,6 +180,21 @@
+ 		}
+ 	}
+ 
++	/// <summary>
++	/// D3c: the merged database only if it has ALREADY been built — this never builds it, so a
++	/// warm-up polling it cannot move the build itself onto its own frame.
++	/// </summary>
++	public static GdbMulti? DatabaseIfBuilt
++	{
++		get
++		{
++			lock (BuildLock)
++			{
++				return _built ? _multi : null;
++			}
++		}
++	}
++
+ 	private static void LogPrint(string message)
+ 	{
+ 		if (AppDomain.CurrentDomain.FriendlyName.Contains("testhost", StringComparison.OrdinalIgnoreCase) ||
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/hero/texture/Engine_HeroTextureMorph.cs refii_ui_11_hover/sdk/src/Engine/hero/texture/Engine_HeroTextureMorph.cs
+--- refii_build_orig/sdk/src/Engine/hero/texture/Engine_HeroTextureMorph.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/hero/texture/Engine_HeroTextureMorph.cs	2026-11-01 19:44:32.356273700 -0400
+@@ -220,7 +220,7 @@
+                     {
+                         own = material.HasMeta(Refii.Models.Engine_ClassicMaterial.ClassicMeta)
+                             ? Refii.Models.Engine_ClassicMaterial.InstanceCopy(material)
+-                            : (ShaderMaterial)material.Duplicate();
++                            : Refii.Models.Engine_MatCopy.Copy(material, "hero");
+                     }
+                 }
+ 
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/environment/Engine_CloudAlpha.cs refii_ui_11_hover/sdk/src/Engine/level/environment/Engine_CloudAlpha.cs
+--- refii_build_orig/sdk/src/Engine/level/environment/Engine_CloudAlpha.cs	1969-12-31 20:00:00.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/environment/Engine_CloudAlpha.cs	2026-11-01 19:44:31.325686100 -0400
+@@ -0,0 +1,42 @@
++using System;
++
++namespace Refii.Level;
++
++/// <summary>
++/// The cloud density map's alpha as the sky samples it on the CPU
++/// (<see cref="Engine_SkyEnvironmentNode"/>'s sun visibility). No engine state, so it is tested
++/// without the engine.
++/// </summary>
++public static class Engine_CloudAlpha
++{
++    /// <summary>
++    /// The alpha bytes of the first <paramref name="texels"/> RGBA8 texels (mip 0 leads the
++    /// data); a short buffer leaves the rest 0, as the loop it came from did.
++    /// </summary>
++    public static byte[] Channel(byte[] rgba, int texels)
++    {
++        var alpha = new byte[Math.Max(texels, 0)];
++        for (int i = 0, a = 3; i < alpha.Length && a < rgba.Length; i++, a += 4)
++        {
++            alpha[i] = rgba[a];
++        }
++
++        return alpha;
++    }
++
++    /// <summary>How many positions differ, counting a length difference as differing texels.</summary>
++    public static int Differences(byte[] a, byte[] b)
++    {
++        int n = Math.Min(a.Length, b.Length);
++        int differ = Math.Abs(a.Length - b.Length);
++        for (int i = 0; i < n; i++)
++        {
++            if (a[i] != b[i])
++            {
++                differ++;
++            }
++        }
++
++        return differ;
++    }
++}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/environment/Engine_Clouds.cs refii_ui_11_hover/sdk/src/Engine/level/environment/Engine_Clouds.cs
+--- refii_build_orig/sdk/src/Engine/level/environment/Engine_Clouds.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/environment/Engine_Clouds.cs	2026-11-01 19:44:31.354370200 -0400
+@@ -233,9 +233,33 @@
+             return null;
+         }
+ 
+-        return Engine_TexImage.TryCreateTexture(bytes, out _);
++        // As Engine_TexImage.TryCreateTexture, keeping the decoded image: the sky reads the map's
++        // alpha on the CPU (Engine_SkyEnvironmentNode.TryCloudAlpha), and Texture2D.GetImage
++        // would fetch it back from the render thread, a synchronous call that waits for every
++        // queued upload (440 ms on the first frame after Bowerstone Market streamed in).
++        Image? image = Engine_TexImage.TryCreateImage(bytes, out _);
++        if (image is null || image.IsEmpty())
++        {
++            return null;
++        }
++
++        ImageTexture texture = ImageTexture.CreateFromImage(image);
++        DensitySources.AddOrUpdate(texture, image);
++        return texture;
+     }
+ 
++    /// <summary>
++    /// The decoded image a density map from <see cref="Build"/> was made from, or null for a
++    /// texture this class did not make. Shared, and possibly still being read by the render
++    /// thread's upload: callers that change it must Duplicate it first.
++    /// </summary>
++    public static Image? DensitySource(Texture2D? texture) =>
++        texture is not null && DensitySources.TryGetValue(texture, out Image? image) ? image : null;
++
++    // Weak keys: an image goes with its texture.
++    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Texture2D, Image>
++        DensitySources = new();
++
+     // Made once: a string literal converts to a new StringName on every call.
+     private static readonly StringName CloudDensityName = "cloud_density";
+     private static readonly StringName LayerParamsName = "layer_params";
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/environment/Engine_SkyEnvironmentNode.cs refii_ui_11_hover/sdk/src/Engine/level/environment/Engine_SkyEnvironmentNode.cs
+--- refii_build_orig/sdk/src/Engine/level/environment/Engine_SkyEnvironmentNode.cs	2026-10-24 13:05:08.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/environment/Engine_SkyEnvironmentNode.cs	2026-11-01 19:44:31.334304600 -0400
+@@ -1426,13 +1426,49 @@
+         }
+ 
+         var texture = material.GetShaderParameter(Param_cloud_density).As<Texture2D>();
+-        Image? image = texture?.GetImage();
++
++        // The map's decoded image, kept by Engine_Clouds when it made the texture: reading it
++        // here never crosses to the render thread. Texture2D.GetImage does, synchronously, and
++        // on the first frame after an area streams in it waits for every queued upload. A
++        // texture Engine_Clouds did not make still reads back, as before.
++        Image? source = Engine_Clouds.DensitySource(texture);
++        bool verify = CloudVerifyEnabled;
++        Image? fromServer = verify || source is null ? texture?.GetImage() : null;
++
++        // The source is shared and the upload may still be reading it: change a copy.
++        Image? image = verify ? fromServer : source is not null ? (Image)source.Duplicate() : fromServer;
+         if (image is null)
+         {
+             _cloudAlpha[index] = map;
+             return false;
+         }
+ 
++        map = AlphaMap(image);
++        _cloudAlpha[index] = map;
++
++        if (verify && source is not null)
++        {
++            (byte[] Alpha, int W, int H) mine = AlphaMap((Image)source.Duplicate());
++            bool same = mine.W == map.W && mine.H == map.H &&
++                        mine.Alpha.AsSpan().SequenceEqual(map.Alpha);
++            GD.Print($"[sky-clouds] layer {index}: VERIFY {(same ? "identical" : "MISMATCH")} " +
++                     $"(server {map.W}x{map.H}, source {mine.W}x{mine.H}, " +
++                     $"{Engine_CloudAlpha.Differences(mine.Alpha, map.Alpha)} texel(s) differ)");
++        }
++        else
++        {
++            GD.Print($"[sky-clouds] layer {index}: alpha map {map.W}x{map.H} " +
++                     (source is not null ? "from the decoded source (no server read)" : "READ BACK from the server (no source kept)"));
++        }
++
++        // As before: the first look answers true even for an empty map; later looks, from the
++        // cache above, answer by its length.
++        return true;
++    }
++
++    /// <summary>The image's alpha channel, texel 0 of mip 0 first. Changes <paramref name="image"/>.</summary>
++    private static (byte[] Alpha, int W, int H) AlphaMap(Image image)
++    {
+         if (image.IsCompressed())
+         {
+             image.Decompress();
+@@ -1446,16 +1482,39 @@
+ 
+         int w = image.GetWidth();
+         int h = image.GetHeight();
+-        byte[] rgba = image.GetData();
+-        var alpha = new byte[w * h];
+-        for (int i = 0, a = 3; i < alpha.Length && a < rgba.Length; i++, a += 4)
++        return (Engine_CloudAlpha.Channel(image.GetData(), w * h), w, h);
++    }
++
++    private static int _cloudVerify = -1;
++
++    /// <summary>
++    /// VERIFY MODE, for validation only: a file named <c>refii_cloud_verify.flag</c> beside the
++    /// executable. The sky then reads each map back from the server as the old code did, uses
++    /// that, and logs whether the decoded source gives the same alpha byte for byte.
++    /// </summary>
++    private static bool CloudVerifyEnabled
++    {
++        get
+         {
+-            alpha[i] = rgba[a];
+-        }
++            if (_cloudVerify < 0)
++            {
++                bool on = false;
++                try
++                {
++                    string dir = System.IO.Path.GetDirectoryName(OS.GetExecutablePath()) ?? "";
++                    on = System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_cloud_verify.flag"));
++                }
++                catch (Exception)
++                {
++                    on = false;
++                }
++
++                _cloudVerify = on ? 1 : 0;
++                GD.Print($"[sky-clouds] density alpha from the decoded source; verify mode {(on ? "ON (old server read kept, results compared)" : "off")}");
++            }
+ 
+-        map = (alpha, w, h);
+-        _cloudAlpha[index] = map;
+-        return true;
++            return _cloudVerify == 1;
++        }
+     }
+ 
+     private static float SampleAlphaBilinear(byte[] alpha, int w, int h, float u, float v)
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/environment/celestial/Engine_CelestialElements.cs refii_ui_11_hover/sdk/src/Engine/level/environment/celestial/Engine_CelestialElements.cs
+--- refii_build_orig/sdk/src/Engine/level/environment/celestial/Engine_CelestialElements.cs	2026-10-24 13:05:08.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/environment/celestial/Engine_CelestialElements.cs	2026-11-01 19:44:31.436895600 -0400
+@@ -721,7 +721,7 @@
+         {
+             return;
+         }
+-        var material = (ShaderMaterial)modern.Duplicate();
++        var material = Refii.Models.Engine_MatCopy.Copy(modern, "celestial");
+         material.Shader = shader;
+         material.SetShaderParameter(PsName + textureName, texture);
+         material.SetShaderParameter(XrSpecConstantsName, 2u);
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/props/Engine_PropDrawRange.cs refii_ui_11_hover/sdk/src/Engine/level/props/Engine_PropDrawRange.cs
+--- refii_build_orig/sdk/src/Engine/level/props/Engine_PropDrawRange.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/props/Engine_PropDrawRange.cs	2026-11-01 19:44:31.476408900 -0400
+@@ -78,9 +78,6 @@
+ 	/// </summary>
+ 	public const string TreeBandMeta = "tree_fade_band";
+ 
+-	private static readonly StringName TreeFadeIn = "xr_tree_fade_in";
+-	private static readonly StringName TreeFadeOut = "xr_tree_fade_out";
+-	private static readonly StringName TreeCentre = "xr_tree_centre";
+ 
+ 	/// <summary>
+ 	/// Whether a TreeMesh's shadow stops at its stated S (`tree_shadow_reach = "stated"`, the
+@@ -258,9 +255,10 @@
+ 		if (mesh is not null && node.HasMeta(TreeBandMeta) &&
+ 			node.GetMeta(TreeBandMeta).AsFloat32Array() is { Length: >= 6 } band)
+ 		{
+-			node.SetInstanceShaderParameter(TreeFadeIn, new Vector4(band[0], band[1], band[2], 0f));
+-			node.SetInstanceShaderParameter(TreeFadeOut, new Vector4(band[3], band[4], band[5], 0f));
+-			node.SetInstanceShaderParameter(TreeCentre, mesh.GetAabb().GetCenter());
++			// Through Engine_PropFade so the band is also kept on this side: its shadow twin copies
++			// it from there, never by reading the server back.
++			Engine_PropFade.SetTreeBand(node, new Vector4(band[0], band[1], band[2], 0f),
++				new Vector4(band[3], band[4], band[5], 0f), mesh.GetAabb().GetCenter());
+ 		}
+ 
+ 		return ApplyStated(node, node.GetMeta(Meta).AsFloat32Array());
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/props/Engine_PropFade.cs refii_ui_11_hover/sdk/src/Engine/level/props/Engine_PropFade.cs
+--- refii_build_orig/sdk/src/Engine/level/props/Engine_PropFade.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/props/Engine_PropFade.cs	2026-11-01 19:44:31.465407400 -0400
+@@ -97,29 +97,267 @@
+ 		}
+ 
+ 		(float end, float inverseLength, float power) = OutBand(radius);
+-		node.SetInstanceShaderParameter(FadeOut, new Vector4(end, inverseLength, power, 0f));
+-		node.SetInstanceShaderParameter(FadeIn, Vector4.Zero);
+-		node.SetInstanceShaderParameter(Centre,
++		WriteBand(node, new Vector4(end, inverseLength, power, 0f), Vector4.Zero,
+ 			node is MultiMeshInstance3D ? Vector3.Zero : mesh.GetAabb().GetCenter());
+ 	}
+ 
++	/// <summary>
++	/// A classic tree's stated band (<see cref="Engine_PropDrawRange.Apply"/>), written through the
++	/// same store as a tier radius so its shadow twin copies it without a server read.
++	/// </summary>
++	public static void SetTreeBand(GeometryInstance3D node, Vector4 fadeIn, Vector4 fadeOut, Vector3 centre) =>
++		WriteBand(node, fadeOut, fadeIn, centre);
++
++	// ---- The store: every value the four uniforms are given, kept on this side -------------------
++
++	/// <summary>The last band and arrival each node was given; see <see cref="Engine_PropFadeStore{TKey}"/>.</summary>
++	internal static readonly Engine_PropFadeStore<GeometryInstance3D> Store = new();
++
++	private static void WriteBand(GeometryInstance3D node, Vector4 fadeOut, Vector4 fadeIn, Vector3 centre)
++	{
++		node.SetInstanceShaderParameter(FadeOut, fadeOut);
++		node.SetInstanceShaderParameter(FadeIn, fadeIn);
++		node.SetInstanceShaderParameter(Centre, centre);
++		Store.SetBand(node, fadeOut, fadeIn, centre);
++	}
++
++	private static void WriteAlpha(GeometryInstance3D node, float alpha)
++	{
++		node.SetInstanceShaderParameter(Alpha, alpha);
++		Store.SetAlpha(node, alpha);
++	}
++
++	/// <summary>A node's four fade uniforms as the shader sees them, unset ones at the shader's default.</summary>
++	public readonly record struct FadeState(Vector4 FadeOut, Vector4 FadeIn, Vector3 Centre, float Alpha)
++	{
++		/// <summary>The shaders' declared defaults: no band, standing (alpha 1).</summary>
++		public static readonly FadeState Defaults = new(Vector4.Zero, Vector4.Zero, Vector3.Zero, 1f);
++
++		/// <summary>What a node holds given what was written to it (nothing: the defaults).</summary>
++		public static FadeState Of(bool known, in FadeSnapshot written) => !known
++			? Defaults
++			: new FadeState(
++				written.HasBand ? written.FadeOut : Vector4.Zero,
++				written.HasBand ? written.FadeIn : Vector4.Zero,
++				written.HasBand ? written.Centre : Vector3.Zero,
++				written.HasAlpha ? written.Alpha : 1f);
++	}
++
++	/// <summary>How <see cref="Copy"/> serves one body/caster pair.</summary>
++	public enum CopyAction
++	{
++		/// <summary>Nothing was ever written to either: the caster already holds what the body does.</summary>
++		Skip,
++
++		/// <summary>The body's band (and arrival, if it has one) from the store; no server read.</summary>
++		FromStore,
++
++		/// <summary>A case the store cannot vouch for: read the server, as before.</summary>
++		Fallback,
++	}
++
++	/// <summary>
++	/// Chooses how to copy. The old copy read the body's four uniforms back from the server and
++	/// wrote them to the caster, skipping when the band read back as nothing. Every writer of the
++	/// four is in this file, so:
++	/// <list type="bullet">
++	/// <item>a body given a band copies it from the store, with its arrival when it has one;</item>
++	/// <item>a body never given a band holds the defaults or nothing, and a caster never written
++	/// holds the defaults too, so copying would change nothing: skip;</item>
++	/// <item>any other mix (a caster already written, a body with an arrival but no band) is rare
++	/// and reads the server exactly as before.</item>
++	/// </list>
++	/// </summary>
++	public static CopyAction PlanCopy(bool fromKnown, in FadeSnapshot from, bool toKnown)
++	{
++		if (fromKnown && from.HasBand)
++		{
++			return CopyAction.FromStore;
++		}
++
++		if (!toKnown && !(fromKnown && from.HasAlpha))
++		{
++			return CopyAction.Skip;
++		}
++
++		return CopyAction.Fallback;
++	}
++
++	/// <summary>The caster's state after a <see cref="CopyAction.FromStore"/> copy.</summary>
++	public static FadeState AfterStoreCopy(in FadeState toBefore, in FadeSnapshot from) =>
++		new(from.FadeOut, from.FadeIn, from.Centre, from.HasAlpha ? from.Alpha : toBefore.Alpha);
++
++	// ---- Counters, for the log and the A/B ----------------------------------------------------
++
++	private static long _copies, _skipped, _fromStore, _fallbacks, _verified, _mismatches;
++	private static int _mismatchLines;
++	private const int MaxMismatchLines = 40;
++
++	/// <summary>One line for the log: how every copy so far was served.</summary>
++	public static string Summary() =>
++		$"[prop-fade] copies {_copies}: from store {_fromStore}, skipped {_skipped}, server fallback {_fallbacks}" +
++		(VerifyEnabled ? $"; verify: {_verified} checked, {_mismatches} mismatch(es)" : "; verify off");
++
++	private static int _verify = -1;
++
++	/// <summary>
++	/// VERIFY MODE, for validation only: a file named <c>refii_fade_verify.flag</c> beside the
++	/// executable. Every copy then also reads the server as the old code did, compares what each
++	/// path would leave on the caster, and does what the OLD code does, so the run looks exactly
++	/// like the build before the store; the log counts and names every disagreement.
++	/// </summary>
++	public static bool VerifyEnabled
++	{
++		get
++		{
++			if (_verify < 0)
++			{
++				bool on = false;
++				try
++				{
++					string dir = System.IO.Path.GetDirectoryName(OS.GetExecutablePath()) ?? "";
++					on = System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_fade_verify.flag"));
++				}
++				catch (Exception)
++				{
++					on = false;
++				}
++
++				_verify = on ? 1 : 0;
++				GD.Print($"[prop-fade] state store active; verify mode {(on ? "ON (old server reads kept, results compared)" : "off")}");
++			}
++
++			return _verify == 1;
++		}
++	}
++
+ 	/// <summary>Gives a cast-only twin or proxy its body's band and arrival, so the shadow follows the copy.</summary>
+ 	public static void Copy(GeometryInstance3D from, GeometryInstance3D to)
+ 	{
++		_copies++;
++		bool fromKnown = Store.TryGet(from, out FadeSnapshot fromWritten);
++		bool toKnown = Store.TryGet(to, out FadeSnapshot toWritten);
++		CopyAction action = PlanCopy(fromKnown, fromWritten, toKnown);
++
++		if (VerifyEnabled)
++		{
++			FadeState toBefore = FadeState.Of(toKnown, toWritten);
++			FadeState old = CopyFromServer(from, to, toBefore);
++			_verified++;
++			FadeState mine = action switch
++			{
++				CopyAction.Skip => toBefore,
++				CopyAction.FromStore => AfterStoreCopy(toBefore, fromWritten),
++				_ => old,
++			};
++			if (mine != old)
++			{
++				_mismatches++;
++				if (_mismatchLines++ < MaxMismatchLines)
++				{
++					GD.Print($"[prop-fade] VERIFY MISMATCH ({action}) {Describe(from)} -> {Describe(to)}: " +
++						$"server {old} / store {mine}");
++				}
++			}
++
++			return;
++		}
++
++		switch (action)
++		{
++			case CopyAction.Skip:
++				_skipped++;
++				return;
++			case CopyAction.FromStore:
++			{
++				_fromStore++;
++				to.SetInstanceShaderParameter(FadeOut, fromWritten.FadeOut);
++				to.SetInstanceShaderParameter(FadeIn, fromWritten.FadeIn);
++				to.SetInstanceShaderParameter(Centre, fromWritten.Centre);
++				Store.SetBand(to, fromWritten.FadeOut, fromWritten.FadeIn, fromWritten.Centre);
++				if (fromWritten.HasAlpha)
++				{
++					WriteAlpha(to, fromWritten.Alpha);
++				}
++
++				return;
++			}
++			default:
++			{
++				_fallbacks++;
++				if (_fallbacks <= 10)
++				{
++					GD.Print($"[prop-fade] server fallback ({_fallbacks}): {Describe(from)} -> {Describe(to)}");
++				}
++
++				CopyFromServer(from, to, FadeState.Of(toKnown, toWritten));
++				return;
++			}
++		}
++	}
++
++	/// <summary>
++	/// The copy as it was: four synchronous reads of the body's uniforms, written to the caster.
++	/// Returns what it leaves on the caster and records it in the store.
++	/// </summary>
++	private static FadeState CopyFromServer(GeometryInstance3D from, GeometryInstance3D to, FadeState toBefore)
++	{
+ 		Variant band = from.GetInstanceShaderParameter(FadeOut);
+ 		if (band.VariantType == Variant.Type.Nil)
+ 		{
+-			return;
++			return toBefore;
+ 		}
+ 
+ 		to.SetInstanceShaderParameter(FadeOut, band);
+-		to.SetInstanceShaderParameter(FadeIn, from.GetInstanceShaderParameter(FadeIn));
+-		to.SetInstanceShaderParameter(Centre, from.GetInstanceShaderParameter(Centre));
++		Variant fadeIn = from.GetInstanceShaderParameter(FadeIn);
++		to.SetInstanceShaderParameter(FadeIn, fadeIn);
++		Variant centre = from.GetInstanceShaderParameter(Centre);
++		to.SetInstanceShaderParameter(Centre, centre);
+ 		Variant alpha = from.GetInstanceShaderParameter(Alpha);
+ 		if (alpha.VariantType != Variant.Type.Nil)
+ 		{
+ 			to.SetInstanceShaderParameter(Alpha, alpha);
+ 		}
++
++		// What the caster now holds. A nil read was written as nil, which Godot turns into the
++		// shader's default; the defaults here are those.
++		var after = new FadeState(
++			band.VariantType == Variant.Type.Vector4 ? band.AsVector4() : Vector4.Zero,
++			fadeIn.VariantType == Variant.Type.Vector4 ? fadeIn.AsVector4() : Vector4.Zero,
++			centre.VariantType == Variant.Type.Vector3 ? centre.AsVector3() : Vector3.Zero,
++			alpha.VariantType == Variant.Type.Float ? alpha.AsSingle() : toBefore.Alpha);
++		Store.SetBand(to, after.FadeOut, after.FadeIn, after.Centre);
++		if (alpha.VariantType == Variant.Type.Float)
++		{
++			Store.SetAlpha(to, after.Alpha);
++		}
++
++		return after;
++	}
++
++	private static string Describe(GeometryInstance3D node)
++	{
++		try
++		{
++			string shader = node.MaterialOverride is ShaderMaterial { Shader: { } s } ? s.ResourcePath : "-";
++			Mesh? mesh = node switch
++			{
++				MeshInstance3D m => m.Mesh,
++				MultiMeshInstance3D mm => mm.Multimesh?.Mesh,
++				_ => null,
++			};
++			if (shader == "-" && mesh is not null && mesh.GetSurfaceCount() > 0 &&
++				mesh.SurfaceGetMaterial(0) is ShaderMaterial { Shader: { } s0 })
++			{
++				shader = s0.ResourcePath;
++			}
++
++			return $"{node.GetClass()} '{node.Name}' [{shader}]";
++		}
++		catch (Exception)
++		{
++			return node.GetClass();
++		}
+ 	}
+ 
+ 	private readonly record struct Arrival(GeometryInstance3D Node, GeometryInstance3D? Caster, long Since);
+@@ -149,8 +387,11 @@
+ 			_ => null,
+ 		};
+ 
+-		node.SetInstanceShaderParameter(Alpha, 0f);
+-		caster?.SetInstanceShaderParameter(Alpha, 0f);
++		WriteAlpha(node, 0f);
++		if (caster is not null)
++		{
++			WriteAlpha(caster, 0f);
++		}
+ 		Arrivals.Add(new Arrival(node, caster, System.Diagnostics.Stopwatch.GetTimestamp()));
+ 	}
+ 
+@@ -175,10 +416,10 @@
+ 			}
+ 
+ 			float alpha = ArrivalFactor((now - arrival.Since) / (double)System.Diagnostics.Stopwatch.Frequency);
+-			arrival.Node.SetInstanceShaderParameter(Alpha, alpha);
++			WriteAlpha(arrival.Node, alpha);
+ 			if (arrival.Caster is { } caster && GodotObject.IsInstanceValid(caster))
+ 			{
+-				caster.SetInstanceShaderParameter(Alpha, alpha);
++				WriteAlpha(caster, alpha);
+ 			}
+ 
+ 			if (alpha >= 1f)
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/props/Engine_PropFadeStore.cs refii_ui_11_hover/sdk/src/Engine/level/props/Engine_PropFadeStore.cs
+--- refii_build_orig/sdk/src/Engine/level/props/Engine_PropFadeStore.cs	1969-12-31 20:00:00.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/props/Engine_PropFadeStore.cs	2026-11-01 19:44:31.467406800 -0400
+@@ -0,0 +1,88 @@
++using System.Runtime.CompilerServices;
++using Godot;
++
++namespace Refii.Level;
++
++/// <summary>What the store holds for one node: the band <see cref="Engine_PropFade"/> last wrote, and its arrival.</summary>
++/// <remarks>
++/// The defaults are the shaders' own (standard_material_body.gdshaderinc and
++/// shadow_caster.gdshader): no band is (0,0,0,0)/(0,0,0,0)/(0,0,0), no arrival is alpha 1.
++/// </remarks>
++public readonly record struct FadeSnapshot(
++	bool HasBand, Vector4 FadeOut, Vector4 FadeIn, Vector3 Centre, bool HasAlpha, float Alpha);
++
++/// <summary>
++/// The fade instance uniforms as last written, per node, so a copy to a shadow twin or proxy
++/// never reads them back from the RenderingServer.
++/// </summary>
++/// <remarks>
++/// <c>GeometryInstance3D.GetInstanceShaderParameter</c> is a synchronous call into the render
++/// thread: with the multi-threaded server it waits for every queued command before it, and while
++/// an area streams in that queue holds its texture and buffer uploads (608 ms measured on
++/// MysteryIsland's present, VRAM +999 MB that frame). Every writer of the four uniforms
++/// (<see cref="Engine_PropFade"/> and <see cref="Engine_PropDrawRange.Apply"/>) writes here as
++/// well, so the last value a node was given is known without asking.
++/// Weak keys: an entry goes with its node. Thread-safe: a scene may be built off the main thread.
++/// Generic only so the bookkeeping can be tested without the engine.
++/// </remarks>
++public sealed class Engine_PropFadeStore<TKey> where TKey : class
++{
++	private sealed class Entry
++	{
++		public bool HasBand;
++		public Vector4 FadeOut;
++		public Vector4 FadeIn;
++		public Vector3 Centre;
++		public bool HasAlpha;
++		public float Alpha;
++	}
++
++	private readonly ConditionalWeakTable<TKey, Entry> _entries = new();
++
++	private Entry For(TKey key) => _entries.GetValue(key, static _ => new Entry());
++
++	/// <summary>Records a band written to <paramref name="key"/>.</summary>
++	public void SetBand(TKey key, Vector4 fadeOut, Vector4 fadeIn, Vector3 centre)
++	{
++		Entry entry = For(key);
++		lock (entry)
++		{
++			entry.HasBand = true;
++			entry.FadeOut = fadeOut;
++			entry.FadeIn = fadeIn;
++			entry.Centre = centre;
++		}
++	}
++
++	/// <summary>Records an arrival alpha written to <paramref name="key"/>.</summary>
++	public void SetAlpha(TKey key, float alpha)
++	{
++		Entry entry = For(key);
++		lock (entry)
++		{
++			entry.HasAlpha = true;
++			entry.Alpha = alpha;
++		}
++	}
++
++	/// <summary>What was written to <paramref name="key"/>; false when nothing ever was.</summary>
++	public bool TryGet(TKey key, out FadeSnapshot snapshot)
++	{
++		if (!_entries.TryGetValue(key, out Entry? entry))
++		{
++			snapshot = default;
++			return false;
++		}
++
++		lock (entry)
++		{
++			snapshot = new FadeSnapshot(entry.HasBand, entry.FadeOut, entry.FadeIn, entry.Centre,
++				entry.HasAlpha, entry.Alpha);
++		}
++
++		return true;
++	}
++
++	/// <summary>Whether anything was ever written to <paramref name="key"/>.</summary>
++	public bool Has(TKey key) => _entries.TryGetValue(key, out _);
++}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/scene/Engine_LevelScene.cs refii_ui_11_hover/sdk/src/Engine/level/scene/Engine_LevelScene.cs
+--- refii_build_orig/sdk/src/Engine/level/scene/Engine_LevelScene.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/scene/Engine_LevelScene.cs	2026-11-01 19:44:31.530435600 -0400
+@@ -1448,7 +1448,7 @@
+                             ShaderMaterial lit = Refii.Models.Engine_ClassicMaterial.WithAmbient(layer, 1, texture, wait: true) ?? layer;
+                             if (ReferenceEquals(lit, layer))
+                             {
+-                                lit = (ShaderMaterial)layer.Duplicate();
++                                lit = Refii.Models.Engine_MatCopy.Copy(layer, "level-lit");
+                             }
+                             // g_LandscapeLightmapUVFactor (VS c14), per landscape (`sub_82A8EA50`):
+                             // (1 / (W * s), 1 / (H * s), 1, 1), the bake's texel size over the
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/level/terrain/Engine_ClassicVista.cs refii_ui_11_hover/sdk/src/Engine/level/terrain/Engine_ClassicVista.cs
+--- refii_build_orig/sdk/src/Engine/level/terrain/Engine_ClassicVista.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/level/terrain/Engine_ClassicVista.cs	2026-11-01 19:44:31.504923800 -0400
+@@ -59,7 +59,7 @@
+         {
+             return null;
+         }
+-        var misted = (ShaderMaterial)page.Duplicate();
++        var misted = Refii.Models.Engine_MatCopy.Copy(page, "vista-misted");
+         misted.Shader = shader;
+         misted.SetMeta(MistedMeta, true);
+         misted.SetShaderParameter("ps_g_MistDensitySampler", mist.Density64);
+@@ -81,7 +81,7 @@
+         {
+             return null;
+         }
+-        var lit = (ShaderMaterial)page.Duplicate();
++        var lit = Refii.Models.Engine_MatCopy.Copy(page, "vista-lit");
+         lit.Shader = shader;
+         lit.SetShaderParameter("ps_g_TextureLightmapSampler", lightmap);
+         lit.SetShaderParameter("xr_background_lightmap", new Vector4(origin.X, origin.Y, factor.X, factor.Y));
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/material/Engine_ClassicBillboards.cs refii_ui_11_hover/sdk/src/Engine/material/Engine_ClassicBillboards.cs
+--- refii_build_orig/sdk/src/Engine/material/Engine_ClassicBillboards.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/material/Engine_ClassicBillboards.cs	2026-11-01 19:44:31.653675500 -0400
+@@ -878,7 +878,7 @@
+         {
+             return held;
+         }
+-        var copy = (ShaderMaterial)own.Duplicate();
++        var copy = Refii.Models.Engine_MatCopy.Copy(own, "billboard");
+         copy.SetShaderParameter(ScreenShadow, Engine_ClassicScreenShadow.White);
+         if (copy.GetShaderParameter(XrBooleansName).VariantType != Variant.Type.Nil)
+         {
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/material/Engine_ClassicMaterial.cs refii_ui_11_hover/sdk/src/Engine/material/Engine_ClassicMaterial.cs
+--- refii_build_orig/sdk/src/Engine/material/Engine_ClassicMaterial.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/material/Engine_ClassicMaterial.cs	2026-11-01 19:44:31.678373400 -0400
+@@ -969,7 +969,7 @@
+     /// <summary>A duplicate's own state: never its source's variants or glass pass.</summary>
+     private static ShaderMaterial DuplicateOwn(ShaderMaterial source)
+     {
+-        var copy = (ShaderMaterial)source.Duplicate();
++        var copy = Refii.Models.Engine_MatCopy.Copy(source, "classic");
+         copy.RemoveMeta(GroupVariantsMeta);
+         return copy;
+     }
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/material/Engine_MatCopy.cs refii_ui_11_hover/sdk/src/Engine/material/Engine_MatCopy.cs
+--- refii_build_orig/sdk/src/Engine/material/Engine_MatCopy.cs	1969-12-31 20:00:00.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/material/Engine_MatCopy.cs	2026-11-01 19:44:31.710650100 -0400
+@@ -0,0 +1,89 @@
++using System.Collections.Generic;
++using Godot;
++
++namespace Refii.Models;
++
++/// <summary>
++/// Copies a world ShaderMaterial without <c>Resource.Duplicate</c>. Duplicate builds the
++/// material's property list, which asks the render thread for the shader's uniform list: a
++/// synchronous round trip per copy with the separate render thread (G06: hero morph copies
++/// averaged 25-29 ms, translucent second passes 100-150 ms; this copy takes ~0.05 ms).
++/// Keeps everything Duplicate keeps for a ShaderMaterial: shader, render priority, next pass,
++/// every shader parameter, resource name, local-to-scene and metadata (containers get their own
++/// copy). G06 verify mode compared both copies in play: 0 differences.
++/// Uniform names are cached per shader and per shader code, so a recompiled shader gets a fresh list.
++/// </summary>
++public static class Engine_MatCopy
++{
++    private static readonly Dictionary<Shader, (int Hash, int Length, StringName[] Names)> UniformNames = new();
++
++    public static ShaderMaterial Copy(ShaderMaterial source, string site)
++    {
++        Shader? shader = source.Shader;
++        if (shader is null)
++        {
++            return (ShaderMaterial)source.Duplicate();
++        }
++
++        var copy = new ShaderMaterial
++        {
++            Shader = shader,
++            RenderPriority = source.RenderPriority,
++            NextPass = source.NextPass,
++            ResourceName = source.ResourceName,
++            ResourceLocalToScene = source.ResourceLocalToScene,
++        };
++        foreach (StringName name in Names(shader))
++        {
++            Variant value = source.GetShaderParameter(name);
++            if (value.VariantType != Variant.Type.Nil)
++            {
++                copy.SetShaderParameter(name, value);
++            }
++        }
++
++        foreach (StringName key in source.GetMetaList())
++        {
++            Variant v = source.GetMeta(key);
++            if (v.VariantType == Variant.Type.Array)
++            {
++                v = v.AsGodotArray().Duplicate();
++            }
++            else if (v.VariantType == Variant.Type.Dictionary)
++            {
++                v = v.AsGodotDictionary().Duplicate();
++            }
++
++            copy.SetMeta(key, v);
++        }
++
++        return copy;
++    }
++
++    private static StringName[] Names(Shader shader)
++    {
++        string code = shader.Code ?? "";
++        int hash = code.GetHashCode();
++        lock (UniformNames)
++        {
++            if (UniformNames.TryGetValue(shader, out var entry) && entry.Hash == hash && entry.Length == code.Length)
++            {
++                return entry.Names;
++            }
++        }
++
++        var list = new List<StringName>();
++        foreach (Godot.Collections.Dictionary uniform in shader.GetShaderUniformList())
++        {
++            list.Add((string)uniform["name"]);
++        }
++
++        StringName[] names = list.ToArray();
++        lock (UniformNames)
++        {
++            UniformNames[shader] = (hash, code.Length, names);
++        }
++
++        return names;
++    }
++}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/material/Engine_MdlMaterial.cs refii_ui_11_hover/sdk/src/Engine/material/Engine_MdlMaterial.cs
+--- refii_build_orig/sdk/src/Engine/material/Engine_MdlMaterial.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/material/Engine_MdlMaterial.cs	2026-11-01 19:44:31.711649900 -0400
+@@ -689,7 +689,7 @@
+ 
+         if (translucent && LoadShared(Engine_ShaderFamily.StandardTranslucentPath) is { } blended)
+         {
+-            var second = (ShaderMaterial)result.Duplicate();
++            var second = Refii.Models.Engine_MatCopy.Copy(result, "mdl-second");
+             second.Shader = blended;
+             second.SetShaderParameter("alpha_scissor_on", false);
+             result.NextPass = second;
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_FrontEndMenuView.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_FrontEndMenuView.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_FrontEndMenuView.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_FrontEndMenuView.cs	2026-11-01 20:38:57.138761200 -0400
+@@ -1,4 +1,4 @@
+-using System;
++﻿using System;
+ using System.Collections.Generic;
+ using Godot;
+ 
+@@ -500,15 +500,126 @@
+ 	private bool _cursorPlaced;
+ 
+ 	/// <summary>
+-	/// The cursor is the pad's: under keyboard and mouse the menu shows no cursor at all — the
+-	/// highlighted row still stands in the highlight slot. Re-applied every frame, so a device
++	/// U04: the shipped cursor art is drawn for the pad AND for the keyboard and mouse, so the
++	/// arrows, the wheel and Enter always show the row they act on. <c>refii_kbm_cursor_off.flag</c>
++	/// beside the exe restores the old PC look (no cursor). Re-applied every frame, so a device
+ 	/// switch shows or hides it at once.
+ 	/// </summary>
++	public static bool CursorOnKeyboardMouse
++	{
++		get
++		{
++			if (_kbmCursor < 0)
++			{
++				bool off = false;
++				try
++				{
++					string dir = System.IO.Path.GetDirectoryName(OS.GetExecutablePath()) ?? "";
++					off = System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_kbm_cursor_off.flag"));
++				}
++				catch (System.Exception)
++				{
++					off = false;
++				}
++
++				_kbmCursor = off ? 0 : 1;
++				GD.Print($"[ui-u04] keyboard/mouse cursor: {(off ? "hidden (refii_kbm_cursor_off.flag)" : "shown (shipped MenuHighlight art)")}");
++			}
++
++			return _kbmCursor == 1;
++		}
++	}
++
++	private static int _kbmCursor = -1;
++
++	// ---------------------------------------------------------------------------------------
++	// U11 / V2: HOVER — a light mark on the row under the mouse. It never moves the selection
++	// (the carousel slides under a pointer that picks, which would loop): the row only draws its
++	// label in a warmer, lighter gold and a touch larger. Not on the highlighted row (the ring
++	// marks it), not on ghosted rows (their 40% stays as authored). `refii_hover_off.flag`
++	// beside the exe turns it off.
++	// ---------------------------------------------------------------------------------------
++
++	/// <summary>
++	/// The hovered label colour. The audit's (255, 240, 196) is the colour the rows already wear,
++	/// so it marked nothing (tested 2026-11-01): the label goes white instead.
++	/// </summary>
++	public static readonly Color HoverLabelColour = new(1f, 1f, 1f);
++
++	/// <summary>How much larger the hovered row draws.</summary>
++	public const float HoverScale = 1.04f;
++
++	/// <summary>How far right the hovered row slides out of the column, in canvas units.</summary>
++	public const float HoverNudge = 10f;
++
++	public static bool HoverEnabled
++	{
++		get
++		{
++			if (_hoverFlag < 0)
++			{
++				bool off = false;
++				try
++				{
++					string dir = System.IO.Path.GetDirectoryName(OS.GetExecutablePath()) ?? "";
++					off = System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_hover_off.flag"));
++				}
++				catch (System.Exception)
++				{
++					off = false;
++				}
++
++				_hoverFlag = off ? 0 : 1;
++				GD.Print($"[ui-u11] list hover mark: {(off ? "off (refii_hover_off.flag)" : "on")}");
++			}
++
++			return _hoverFlag == 1;
++		}
++	}
++
++	private static int _hoverFlag = -1;
++
++	private Engine_UiExpandableMenu.Item? _hover;
++	private bool _hoverDirty;
++	private bool _hoverLogged;
++
++	/// <summary>
++	/// The row the mouse is over, stated each frame by the pointer (null when none, when the pad
++	/// is in use, or when the keyboard moved the selection since the mouse last moved).
++	/// </summary>
++	public Engine_UiExpandableMenu.Item? Hover
++	{
++		get => _hover;
++		set
++		{
++			if (!HoverEnabled)
++			{
++				value = null;
++			}
++
++			if (!ReferenceEquals(_hover, value))
++			{
++				_hover = value;
++				_hoverDirty = true;
++				if (value is not null && !_hoverLogged)
++				{
++					_hoverLogged = true;
++					GD.Print($"[ui-u11] hover first marks a row on {Name}: '{value.StatedLabel ?? value.TextTag}'");
++				}
++			}
++		}
++	}
++
++	private bool HoverMarks(Engine_UiExpandableMenu.Item item) =>
++		ReferenceEquals(item, _hover) && !item.IsGhosted && Menu is not null &&
++		!ReferenceEquals(item, Menu.Highlighted);
++
+ 	private void ApplyCursorVisibility()
+ 	{
+ 		if (_cursor is not null && GodotObject.IsInstanceValid(_cursor))
+ 		{
+-			bool show = _cursorShown && _cursorPlaced && !Engine_UiInputMode.KeyboardMouse;
++			bool show = _cursorShown && _cursorPlaced &&
++				(!Engine_UiInputMode.KeyboardMouse || CursorOnKeyboardMouse);
+ 			if (_cursor.Visible != show)
+ 			{
+ 				_cursor.Visible = show;
+@@ -718,7 +829,10 @@
+ 				continue;
+ 			}
+ 
+-			if (Engine_UiPointer.CanvasBounds(row) is { } bounds && bounds.HasPoint(canvas) &&
++			// The hovered row slid right by HoverNudge: its hit box keeps the strip it left, so
++			// a pointer on the row's left edge does not lose it and flicker.
++			if (Engine_UiPointer.CanvasBounds(row) is { } bounds &&
++				(ReferenceEquals(item, _hover) ? bounds.GrowIndividual(HoverNudge, 0f, 0f, 0f) : bounds).HasPoint(canvas) &&
+ 				row.GlobalPosition.Z > bestZ)
+ 			{
+ 				best = item;
+@@ -1357,6 +1471,47 @@
+ 		return n;
+ 	}
+ 
++	private static bool _cursorQuadsLogged;
++
++	/// <summary>
++	/// U04b/c: the cursor's `green_top` quads (frames_elements.tex) bake the pad's A into the
++	/// art; they, and any quad cut from the button atlas (`abyx`), get the A keycap
++	/// so the keyboard shows its key (the shader swaps on ui_keyboard_mode).
++	/// </summary>
++	private static void KeycapCursor(Node node, string trail)
++	{
++		if (node is MeshInstance3D quad)
++		{
++			string path = quad.HasMeta("texture_path") ? quad.GetMeta("texture_path").AsString() : "";
++			var mat = quad.MaterialOverride as ShaderMaterial;
++			bool keyed = false;
++			if (mat is not null && (path.Replace('\\', '/').ToLowerInvariant().Contains("abyx") ||
++				quad.Name.ToString().StartsWith("green_top", System.StringComparison.Ordinal)))
++			{
++				mat.SetShaderParameter("keycap_tex", Engine_UiKeyGlyphs.KeycapFor("A"));
++				mat.SetShaderParameter("has_keycap", true);
++				keyed = true;
++			}
++
++			if (!_cursorQuadsLogged)
++			{
++				GD.Print($"[ui-u04] cursor quad {trail} tex='{path}' " +
++					$"uv={mat?.GetShaderParameter("uv1_offset")} size={mat?.GetShaderParameter("uv1_scale")} " +
++					$"mat={(mat is null ? "none" : "shader")} keycap={keyed}");
++			}
++		}
++
++		foreach (Node child in node.GetChildren())
++		{
++			KeycapCursor(child, trail + "/" + child.Name);
++		}
++
++		if (trail.IndexOf('/') < 0)
++		{
++			_cursorQuadsLogged = true;
++		}
++	}
++
+ 	private void BuildCursor()
+ 	{
+ 		if (CursorTemplate is not null)
+@@ -1387,6 +1542,8 @@
+ 				}
+ 			}
+ 
++			KeycapCursor(_cursor, _cursor.Name);
++
+ 			if (CursorPose is { } pose)
+ 			{
+ 				_cursor.Transform = pose;
+@@ -1741,6 +1898,13 @@
+ 		UpdateScrollBar();
+ 		if (!_sliding)
+ 		{
++			// U11: a hover change at rest redraws the rows once (a slide redraws them anyway).
++			if (_hoverDirty)
++			{
++				_hoverDirty = false;
++				ApplyPoses();
++			}
++
+ 			return;
+ 		}
+ 
+@@ -1808,15 +1972,20 @@
+ 
+ 			_rows[r].Visible = true;
+ 
+-			_rows[r].Position = new Vector3(pose.X, pose.Y, 0f);
+-			_rows[r].Scale = new Vector3(pose.Scale, pose.Scale, 1f);
++			// U11: the hovered row, a touch larger and in the lighter gold.
++			bool hovered = HoverMarks(_rowItem[r]!);
++			float scale = hovered ? pose.Scale * HoverScale : pose.Scale;
++			Color labelColour = hovered ? HoverLabelColour : pose.LabelColour;
++
++			_rows[r].Position = new Vector3(hovered ? pose.X + HoverNudge : pose.X, pose.Y, 0f);
++			_rows[r].Scale = new Vector3(scale, scale, 1f);
+ 
+ 			// Emphasis is not drawn here: `UpdateTabInnerTexture` states it as the tab FACE and its
+ 			// border tint, which SetTabFace applies. Dimming as well would apply the mark twice.
+ 			// The slot's opacity and the row's ghosting MULTIPLY — the script writes them on
+ 			// different elements, the component and `Icon.Title`, so they compose.
+ 			var tint = new Color(
+-				pose.LabelColour.R, pose.LabelColour.G, pose.LabelColour.B,
++				labelColour.R, labelColour.G, labelColour.B,
+ 				pose.Opacity / 100f * (pose.LabelOpacity / 100f) * FocusOpacity);
+ 			Engine_UiTheme.Retint(_labels[r], tint);
+ 
+@@ -1907,6 +2076,13 @@
+ 		// ability count, the new-item marker — composed at spawn time.
+ 		string display = item.StatedLabel ?? Resolve(item.TextTag);
+ 
++		// U11 / V5: the pause book states its rows' text from the guest tree, English for the
++		// host-only Quit to Desktop rows; the same PT-BR words as Resolve.
++		if (Engine_UiLocale.IsPortuguese && HostLabelsPtBr.TryGetValue(display, out string? hostPtBr))
++		{
++			display = hostPtBr;
++		}
++
+ 		// AN UNVIEWED ITEM ROW CARRIES THE "!" — `sub_826CE230` appends `<exclamation.img>` at
+ 		// spawn when `*(item+20) == 0` (0x826CE378); the screen's highlight tick strips it when
+ 		// the row is seen. Drawn from the row's restated flag rather than baked into its label,
+@@ -1990,14 +2166,31 @@
+ 	/// </summary>
+ 	public string Resolve(string tag)
+ 	{
+-		if (Theme?.Resolve(tag) is { Length: > 0 } resolved)
++		string? resolved = Theme?.Resolve(tag);
++
++		// U11 / V5: the host-only "Quit to Desktop" rows have no shipped tag, so the translation
++		// mod cannot reach them; their PT-BR label is stated here (wording as the book's own
++		// "Sair para a tela de título" / "Sair sem Salvar"). The theme hands an unknown tag back
++		// as itself, so "resolved to the tag" is the unresolved case.
++		if ((resolved is null || resolved.Length == 0 || resolved == tag) &&
++			Engine_UiLocale.IsPortuguese && HostLabelsPtBr.TryGetValue(tag, out string? ptbr))
+ 		{
+-			return resolved;
++			return ptbr;
+ 		}
+ 
+-		return tag;
++		return resolved is { Length: > 0 } ? resolved : tag;
+ 	}
+ 
++	/// <summary>U11 / V5: PT-BR labels for host-only rows that have no Babel tag.</summary>
++	private static readonly System.Collections.Generic.Dictionary<string, string> HostLabelsPtBr = new()
++	{
++		["Quit to Desktop"] = "Sair para a área de trabalho",
++		["Save and Quit to Desktop"] = "Salvar e sair para a área de trabalho",
++		["Quit to Desktop and Don't Save"] = "Sair para a área de trabalho sem salvar",
++		["Save and Quit to Title"] = "Salvar e sair para a tela de título",
++		["Quit to Title and Don't Save"] = "Sair para a tela de título sem salvar",
++	};
++
+ 	/// <summary>
+ 	/// Finds a row component to clone inside a built presentation, by the script's own test:
+ 	/// <c>g_MenuFormatter:onInitialize</c> reads <c>getElement('Buttons', self.parent)</c> and keeps
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_HudView.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_HudView.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_HudView.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_HudView.cs	2026-11-01 19:44:31.778184500 -0400
+@@ -1205,7 +1205,7 @@
+         var owned = new List<ShaderMaterial>();
+         if (node is MeshInstance3D mesh && mesh.MaterialOverride is ShaderMaterial shared)
+         {
+-            var copy = (ShaderMaterial)shared.Duplicate();
++            var copy = Engine_UiSceneBuilder.CopyMaterial(shared);
+             mesh.MaterialOverride = copy;
+             owned.Add(copy);
+         }
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiBoxes.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiBoxes.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiBoxes.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiBoxes.cs	2026-11-01 19:44:31.799780900 -0400
+@@ -165,7 +165,7 @@
+ 				{
+ 					label.Scale *= ChoiceTextScale;
+ 					if (label is MeshInstance3D { MaterialOverride: ShaderMaterial material } text)
+-						text.MaterialOverride = (ShaderMaterial)material.Duplicate();
++						text.MaterialOverride = Engine_UiSceneBuilder.CopyMaterial(material);
+ 				}
+ 				if (clone.GetNodeOrNull<Node3D>(P("Choices/Multiplayer_Button") + $"{i + 1}/" + P("Choice1/RimSelect")) is { } rim)
+ 					RevealSelectionArt(rim);
+@@ -1159,7 +1159,7 @@
+ 		if (panel._front?.GetNodeOrNull<MeshInstance3D>(P("NameAndIcon/IconGraphic")) is { } iconMesh &&
+ 			iconMesh.MaterialOverride is ShaderMaterial shared)
+ 		{
+-			panel._iconMaterial = (ShaderMaterial)shared.Duplicate();
++			panel._iconMaterial = Engine_UiSceneBuilder.CopyMaterial(shared);
+ 			iconMesh.MaterialOverride = panel._iconMaterial;
+ 		}
+ 
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiCursor.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiCursor.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiCursor.cs	1969-12-31 20:00:00.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiCursor.cs	2026-11-01 20:13:22.018227700 -0400
+@@ -0,0 +1,206 @@
++using Godot;
++
++namespace Refii.Ui;
++
++/// <summary>
++/// U12: the mouse pointer in the book's own colours, in place of the Windows arrow.
++/// <list type="bullet">
++/// <item><c>refii_cursor.png</c> beside the exe: that picture is the pointer (scaled to the
++/// size bucket, aspect kept). Its hotspot is read from <c>refii_cursor_hotspot.txt</c> as
++/// "x,y" in the PNG's own pixels; without it, the top-left corner.</item>
++/// <item>Otherwise a gold arrow with a dark-brown rim, the gold and brown of the menu tabs,
++/// drawn here from a polygon (supersampled), so no asset ships. (A drawn gauntlet was tried
++/// 2026-11-01 and rejected: hand-drawn shapes at 32 px read crude.)</item>
++/// </list>
++/// Scaled with the window height. <c>refii_cursor_off.flag</c> keeps the system arrow.
++/// </summary>
++public static class Engine_UiCursor
++{
++	private static bool _applied;
++	private static int _appliedSize;
++
++	// The arrow on a 32-unit grid: tip at the top-left (the hotspot), the shaft and the notch.
++	private static readonly Vector2[] Arrow =
++	{
++		new(2f, 2f), new(2f, 25f), new(7.5f, 20f), new(11.5f, 28.5f),
++		new(15.5f, 26.5f), new(11.5f, 18.5f), new(19.5f, 18.5f),
++	};
++
++	private static readonly Color Rim = new(0.16f, 0.09f, 0.03f);
++	private static readonly Color GoldTop = new(1.00f, 0.92f, 0.62f);
++	private static readonly Color GoldBottom = new(0.72f, 0.50f, 0.17f);
++	private static readonly Color Shine = new(1f, 0.98f, 0.86f);
++
++	/// <summary>Sets the pointer once, and again if the window moves to another size bucket.</summary>
++	public static void Apply(float windowHeight)
++	{
++		int size = windowHeight >= 1900f ? 64 : windowHeight >= 1300f ? 48 : 32;
++		if (_applied && size == _appliedSize)
++		{
++			return;
++		}
++
++		_applied = true;
++		_appliedSize = size;
++		string dir = ExeDir();
++		if (System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_cursor_off.flag")))
++		{
++			GD.Print("[ui-u12] fable pointer: off (refii_cursor_off.flag)");
++			return;
++		}
++
++		if (FromFile(dir, size) is { } custom)
++		{
++			Set(custom.Image, custom.Hotspot);
++			GD.Print($"[ui-u12] fable pointer: refii_cursor.png ({custom.Image.GetWidth()}x{custom.Image.GetHeight()}, hotspot {custom.Hotspot})");
++			return;
++		}
++
++		Set(Draw(size), new Vector2(2f, 2f) * (size / 32f));
++		GD.Print($"[ui-u12] fable pointer: gold arrow ({size}px)");
++	}
++
++	private static void Set(Image image, Vector2 hotspot)
++	{
++		Input.SetCustomMouseCursor(image, Input.CursorShape.Arrow, hotspot);
++		Input.SetCustomMouseCursor(image, Input.CursorShape.PointingHand, hotspot);
++	}
++
++	private static string ExeDir()
++	{
++		try
++		{
++			return System.IO.Path.GetDirectoryName(OS.GetExecutablePath()) ?? "";
++		}
++		catch (System.Exception)
++		{
++			return "";
++		}
++	}
++
++	/// <summary>The player's own picture, scaled so its longer side is the bucket size.</summary>
++	private static (Image Image, Vector2 Hotspot)? FromFile(string dir, int size)
++	{
++		string path = System.IO.Path.Combine(dir, "refii_cursor.png");
++		if (!System.IO.File.Exists(path))
++		{
++			return null;
++		}
++
++		var image = new Image();
++		if (image.Load(path) != Error.Ok || image.GetWidth() <= 0 || image.GetHeight() <= 0)
++		{
++			GD.PushWarning($"[ui-u12] refii_cursor.png could not be read; the gold arrow stands");
++			return null;
++		}
++
++		image.Convert(Image.Format.Rgba8);
++		var hotspot = Vector2.Zero;
++		string hotPath = System.IO.Path.Combine(dir, "refii_cursor_hotspot.txt");
++		if (System.IO.File.Exists(hotPath))
++		{
++			string[] parts = System.IO.File.ReadAllText(hotPath).Split(',', ';', ' ');
++			if (parts.Length >= 2 &&
++				float.TryParse(parts[0].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float hx) &&
++				float.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float hy))
++			{
++				hotspot = new Vector2(hx, hy);
++			}
++		}
++
++		int longer = Mathf.Max(image.GetWidth(), image.GetHeight());
++		if (longer != size)
++		{
++			float k = (float)size / longer;
++			image.Resize(Mathf.Max(1, Mathf.RoundToInt(image.GetWidth() * k)),
++				Mathf.Max(1, Mathf.RoundToInt(image.GetHeight() * k)), Image.Interpolation.Lanczos);
++			hotspot *= k;
++		}
++
++		hotspot = hotspot.Clamp(Vector2.Zero, new Vector2(image.GetWidth() - 1, image.GetHeight() - 1));
++		return (image, hotspot);
++	}
++
++	private static Image Draw(int size)
++	{
++		const int Samples = 4;
++		float unit = 32f / size;
++		const float RimWidth = 1.6f;
++		Image image = Image.CreateEmpty(size, size, false, Image.Format.Rgba8);
++		for (int y = 0; y < size; ++y)
++		{
++			for (int x = 0; x < size; ++x)
++			{
++				float r = 0f, g = 0f, b = 0f, a = 0f;
++				for (int sy = 0; sy < Samples; ++sy)
++				{
++					for (int sx = 0; sx < Samples; ++sx)
++					{
++						var p = new Vector2((x + (sx + 0.5f) / Samples) * unit, (y + (sy + 0.5f) / Samples) * unit);
++						bool inside = Inside(p);
++						float edge = EdgeDistance(p);
++						Color c;
++						if (inside && edge > RimWidth)
++						{
++							float t = Mathf.Clamp((p.Y - 2f) / 26f, 0f, 1f);
++							c = GoldTop.Lerp(GoldBottom, t);
++							if (edge < RimWidth + 1.1f && p.X < 4.6f)
++							{
++								c = c.Lerp(Shine, 0.6f);
++							}
++						}
++						else if (inside || edge < 0.9f)
++						{
++							c = Rim;
++						}
++						else
++						{
++							continue;
++						}
++
++						r += c.R;
++						g += c.G;
++						b += c.B;
++						a += 1f;
++					}
++				}
++
++				if (a > 0f)
++				{
++					image.SetPixel(x, y, new Color(r / a, g / a, b / a, a / (Samples * Samples)));
++				}
++			}
++		}
++
++		return image;
++	}
++
++	private static bool Inside(Vector2 p)
++	{
++		bool inside = false;
++		for (int i = 0, j = Arrow.Length - 1; i < Arrow.Length; j = i++)
++		{
++			Vector2 a = Arrow[i], b = Arrow[j];
++			if ((a.Y > p.Y) != (b.Y > p.Y) && p.X < (b.X - a.X) * (p.Y - a.Y) / (b.Y - a.Y) + a.X)
++			{
++				inside = !inside;
++			}
++		}
++
++		return inside;
++	}
++
++	private static float EdgeDistance(Vector2 p)
++	{
++		float best = float.MaxValue;
++		for (int i = 0, j = Arrow.Length - 1; i < Arrow.Length; j = i++)
++		{
++			Vector2 a = Arrow[j], b = Arrow[i];
++			Vector2 ab = b - a;
++			float t = Mathf.Clamp((p - a).Dot(ab) / ab.LengthSquared(), 0f, 1f);
++			best = Mathf.Min(best, p.DistanceTo(a + ab * t));
++		}
++
++		return best;
++	}
++}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiInventorySource.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiInventorySource.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiInventorySource.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiInventorySource.cs	2026-11-01 20:38:44.707211600 -0400
+@@ -304,6 +304,11 @@
+ 
+ 			string tag = NameTagOf(record);
+ 			string label = LabelOf(record, tag);
++			if (record.Category is >= 17 and <= 23 && worn.Contains(record.RecordId))
++			{
++				label = EquippedLabel(label);
++			}
++
+ 			if (tag.Length == 0)
+ 			{
+ 				++unnamed;
+@@ -368,6 +373,40 @@
+ 		return rows;
+ 	}
+ 
++	/// <summary>
++	/// U10: the emphasised (purple) row is what the hero holds or wears, but the tint alone does
++	/// not say so — the row also reads "(Equipado)". <c>refii_equipped_tag_off.flag</c> beside
++	/// the exe drops the suffix (the tint stays, as shipped).
++	/// </summary>
++	private static string EquippedLabel(string label)
++	{
++		if (_equippedTag < 0)
++		{
++			bool off = false;
++			try
++			{
++				string dir = System.IO.Path.GetDirectoryName(Godot.OS.GetExecutablePath()) ?? "";
++				off = System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_equipped_tag_off.flag"));
++				Godot.GD.Print($"[ui-u10] equipped suffix: {(off ? "off (refii_equipped_tag_off.flag)" : "on")}");
++			}
++			catch (System.Exception)
++			{
++				off = false;
++			}
++
++			_equippedTag = off ? 0 : 1;
++		}
++
++		string suffix = Engine_UiLocale.IsPortuguese ? EquippedSuffix : EquippedSuffixEnglish;
++		return _equippedTag == 1 && !label.EndsWith(suffix, System.StringComparison.Ordinal)
++			? label + suffix
++			: label;
++	}
++
++	private const string EquippedSuffix = " (Equipado)";
++	private const string EquippedSuffixEnglish = " (Equipped)";
++	private static int _equippedTag = -1;
++
+ 	private static readonly Dictionary<string, string> Said =
+ 		new(System.StringComparer.Ordinal);
+ 
+@@ -829,7 +868,7 @@
+ 			int at = rows.FindIndex(r => r.Id == heldId);
+ 			if (heldId != 0u && at >= 0)
+ 			{
+-				rows[at] = rows[at] with { Emphasised = true };
++				rows[at] = rows[at] with { Emphasised = true, Label = EquippedLabel(rows[at].Label) };
+ 			}
+ 			else if (heldId != 0u && TryWeaponType(heldId, out uint heldType) &&
+ 				WeaponClass((int)heldType) == wanted)
+@@ -839,7 +878,7 @@
+ 				string tag = NameTagOf(heldRecord);
+ 				rows.Insert(0, new Engine_UiMenuSources.Row(
+ 					Name: tag.Length != 0 ? tag : $"Item:{heldId:X8}",
+-					Label: LabelOf(heldRecord, tag),
++					Label: EquippedLabel(LabelOf(heldRecord, tag)),
+ 					Icon: IconOf(heldRecord),
+ 					EventType: 0,
+ 					Id: heldId,
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiItemPage.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiItemPage.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiItemPage.cs	2026-10-10 08:19:15.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiItemPage.cs	2026-11-01 19:44:31.867806800 -0400
+@@ -461,24 +461,44 @@
+ 			return null;
+ 		}
+ 
+-		if (!ReferenceEquals(_indexedFor, multi))
++		EnsureNameTagIndex(multi);
++		return _byNameTag.TryGetValue(nameTag, out ItemDetail? found) ? found : null;
++	}
++
++	/// <summary>Indexes every record's name tag, once per database.</summary>
++	/// <returns>True when this call built it.</returns>
++	private static bool EnsureNameTagIndex(GdbMulti multi)
++	{
++		if (ReferenceEquals(_indexedFor, multi))
++		{
++			return false;
++		}
++
++		_byNameTag.Clear();
++		foreach (ItemDetail item in Engine_ItemDetails.Build(multi))
+ 		{
+-			_byNameTag.Clear();
+-			foreach (ItemDetail item in Engine_ItemDetails.Build(multi))
++			if (item.NameTagName.Length > 0)
+ 			{
+-				if (item.NameTagName.Length > 0)
+-				{
+-					_byNameTag.TryAdd(item.NameTagName, item);
+-				}
++				_byNameTag.TryAdd(item.NameTagName, item);
+ 			}
+-
+-			_indexedFor = multi;
+ 		}
+ 
+-		return _byNameTag.TryGetValue(nameTag, out ItemDetail? found) ? found : null;
++		_indexedFor = multi;
++		return true;
+ 	}
+ 
+ 	/// <summary>
++	/// D3c — THE INDEX IS BUILT AHEAD OF THE FIRST ITEM BOOK. Built lazily, it fell to the
++	/// first FOLDER row a book highlights ('Melee', 'KeyItems'): no record of its own, so the
++	/// lookup reached the name tags and walked all ~105k records — 157 ms inside the frame the
++	/// book opened on. The game window calls this while a loading screen is up; the lazy path
++	/// above stays as the fallback.
++	/// </summary>
++	/// <returns>The tags indexed, or -1 when the index already existed.</returns>
++	public static int WarmNameTagIndex(GdbMulti multi) =>
++		EnsureNameTagIndex(multi) ? _byNameTag.Count : -1;
++
++	/// <summary>
+ 	/// THE ITEM'S PICTURE, on Page1. Dumped from the shipped files, the three item books put it
+ 	/// at `Page1.Contents.ItemImage` (gift, shop) and `Page1.Contents.TypeSpecific.ItemImage`
+ 	/// (equipment), so both tails are stated and a key matching nothing is simply unused.
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiLocale.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiLocale.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiLocale.cs	1969-12-31 20:00:00.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiLocale.cs	2026-11-01 20:39:29.088812300 -0400
+@@ -0,0 +1,54 @@
++using Godot;
++using Refii.Text;
++
++namespace Refii.Ui;
++
++/// <summary>
++/// U13: whether the string book the guest reads is the community PT-BR translation. The game has
++/// no Portuguese culture — the translation replaces the en-uk book.babel in place — so the
++/// culture name cannot say it. The text can: the shipped en-uk book has a dozen strings with
++/// ç/ã/õ (loan words), the PT-BR book has tens of thousands. The host-only strings this build adds
++/// ("(Equipado)", the Quit to Desktop/Title rows) are shown in Portuguese only when this is true,
++/// so an English player keeps English text.
++/// </summary>
++public static class Engine_UiLocale
++{
++	/// <summary>Strings with a Portuguese-only letter above which the book counts as PT-BR.</summary>
++	private const int PortugueseThreshold = 1000;
++
++	private static readonly char[] PortugueseLetters = { 'ç', 'ã', 'õ', 'Ç', 'Ã', 'Õ' };
++
++	private static Engine_BabelDatabase? _seen;
++
++	/// <summary>True once a loaded string book reads as the PT-BR translation.</summary>
++	public static bool IsPortuguese { get; private set; }
++
++	/// <summary>Called whenever the host adopts a string book; one pass over its text.</summary>
++	public static void Note(Engine_BabelDatabase strings)
++	{
++		if (ReferenceEquals(strings, _seen))
++		{
++			return;
++		}
++
++		_seen = strings;
++		int hits = 0;
++		try
++		{
++			foreach ((uint _, string value) in strings.Entries())
++			{
++				if (value.IndexOfAny(PortugueseLetters) >= 0 && ++hits >= PortugueseThreshold)
++				{
++					break;
++				}
++			}
++		}
++		catch (System.Exception exception)
++		{
++			GD.PushWarning($"[ui-u13] locale probe failed: {exception.Message}");
++		}
++
++		IsPortuguese = hits >= PortugueseThreshold;
++		GD.Print($"[ui-u13] string book reads as {(IsPortuguese ? "PT-BR" : "English")} ({hits}+ strings with ç/ã/õ)");
++	}
++}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiOwnedBook.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiOwnedBook.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiOwnedBook.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiOwnedBook.cs	2026-11-01 19:44:32.039747500 -0400
+@@ -777,7 +777,8 @@
+ 
+ 	private void ProbeLegend(string?[]? texts)
+ 	{
+-		if (_resolve is null || Document is null || Template?.ScreenId != 0)
++		// A PROBE, so a diagnostic: it re-logged on every opacity step of the legend's fade.
++		if (!Engine_UiTrace.Verbose || _resolve is null || Document is null || Template?.ScreenId != 0)
+ 		{
+ 			return;
+ 		}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiPointer.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiPointer.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiPointer.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiPointer.cs	2026-11-01 19:44:46.195612500 -0400
+@@ -54,6 +54,22 @@
+ 	/// <summary>One input event. Mouse events only; the rest are ignored.</summary>
+ 	public static void Feed(InputEvent @event)
+ 	{
++		// U08: Home / End on a list jump to its first / last row. Edges only (no auto-repeat),
++		// read by GameUi.PointerList and cleared with the clicks at the end of the frame.
++		if (@event is InputEventKey { Pressed: true, Echo: false } key)
++		{
++			if (key.Keycode == Key.Home)
++			{
++				HomePressed = true;
++			}
++			else if (key.Keycode == Key.End)
++			{
++				EndPressed = true;
++			}
++
++			return;
++		}
++
+ 		if (!GameInput.MouseInput)
+ 		{
+ 			return;
+@@ -121,6 +137,23 @@
+ 		LeftPressed = false;
+ 		RightPressed = false;
+ 		WheelSteps = 0;
++		HomePressed = false;
++		EndPressed = false;
++	}
++
++	/// <summary>U08: Home was pressed this frame (jump to the first row of the list).</summary>
++	public static bool HomePressed { get; private set; }
++
++	/// <summary>U08: End was pressed this frame (jump to the last row of the list).</summary>
++	public static bool EndPressed { get; private set; }
++
++	/// <summary>U08: takes this frame's Home/End press: -1 Home, +1 End, 0 none.</summary>
++	public static int TakeJump()
++	{
++		int jump = HomePressed ? -1 : EndPressed ? 1 : 0;
++		HomePressed = false;
++		EndPressed = false;
++		return jump;
+ 	}
+ 
+ 	/// <summary>Takes this frame's left click, so two consumers cannot both act on it.</summary>
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiPresentationHost.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiPresentationHost.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiPresentationHost.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiPresentationHost.cs	2026-11-01 20:38:44.643635200 -0400
+@@ -716,6 +716,7 @@
+ 	private void AdoptStrings(Engine_BabelDatabase strings, string source)
+ 	{
+ 		Strings = strings;
++		Engine_UiLocale.Note(strings);
+ 		if (Theme is not null)
+ 		{
+ 			Theme.Strings = Strings;
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiSceneBuilder.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiSceneBuilder.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiSceneBuilder.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiSceneBuilder.cs	2026-11-01 19:45:54.093812900 -0400
+@@ -766,6 +766,9 @@
+ 	private static readonly Shader TextShader =
+ 		GD.Load<Shader>("res://src/Engine/ui/ui_text.gdshader");
+ 
++	/// <summary>U11: whether a mesh is a built text label (has the label material).</summary>
++	public static bool IsLabel(MeshInstance3D mesh) => LabelMaterial(mesh) is not null;
++
+ 	/// <summary>A built label's colour, or white when the node is not one.</summary>
+ 	public static Color TextColour(MeshInstance3D label) =>
+ 		LabelMaterial(label) is { } m ? m.GetShaderParameter(ColourName).AsColor() : Colors.White;
+@@ -879,12 +882,64 @@
+ 			return false;
+ 		}
+ 
+-		// The Shader itself is not duplicated: Duplicate copies the parameter set and keeps
++		// The Shader itself is not duplicated: the copy carries the parameter set and keeps
+ 		// pointing at the one compiled program.
+-		mesh.MaterialOverride = (ShaderMaterial)shared.Duplicate();
++		mesh.MaterialOverride = CopyMaterial(shared);
+ 		return true;
+ 	}
+ 
++	private static readonly System.Collections.Generic.Dictionary<Shader, StringName[]> UniformNames = new();
++
++	/// <summary>
++	/// A private copy of a shader material: the same parameter set <c>Resource.Duplicate</c>
++	/// copies, without its cost. Duplicate walks the material's property list, and building
++	/// that list asks the render thread for the shader's uniforms — a synchronous round trip
++	/// with the separate render thread, paid once per quad (measured U01: 420 list quads 85 ms
++	/// in game, a one-quad popup up to 47 ms). The uniform names are fixed per compiled shader,
++	/// so they are read once and kept; the values come from the material's own cache.
++	/// </summary>
++	public static ShaderMaterial CopyMaterial(ShaderMaterial shared)
++	{
++		Shader? shader = shared.Shader;
++		if (shader is null)
++		{
++			return (ShaderMaterial)shared.Duplicate();
++		}
++
++		StringName[]? names;
++		lock (UniformNames)
++		{
++			if (!UniformNames.TryGetValue(shader, out names))
++			{
++				var list = new System.Collections.Generic.List<StringName>();
++				foreach (Godot.Collections.Dictionary uniform in shader.GetShaderUniformList())
++				{
++					list.Add((string)uniform["name"]);
++				}
++
++				names = list.ToArray();
++				UniformNames[shader] = names;
++			}
++		}
++
++		var copy = new ShaderMaterial
++		{
++			Shader = shader,
++			RenderPriority = shared.RenderPriority,
++			NextPass = shared.NextPass,
++		};
++		foreach (StringName name in names)
++		{
++			Variant value = shared.GetShaderParameter(name);
++			if (value.VariantType != Variant.Type.Nil)
++			{
++				copy.SetShaderParameter(name, value);
++			}
++		}
++
++		return copy;
++	}
++
+ 	/// <summary>Replaces a built quad's primary texture. Used where the guest names art we clone.</summary>
+ 	public static bool SetQuadTexture(MeshInstance3D mesh, Texture2D texture)
+ 	{
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiSpellAssignSecondary.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiSpellAssignSecondary.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiSpellAssignSecondary.cs	2026-10-24 03:58:01.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiSpellAssignSecondary.cs	2026-11-01 19:44:31.936264000 -0400
+@@ -210,7 +210,7 @@
+ 			quad.Position = new Vector3(PromptGlyphX, y + (glyph.Position.Y - done.Position.Y), glyph.Position.Z);
+ 			if (quad.MaterialOverride is ShaderMaterial shared)
+ 			{
+-				var material = (ShaderMaterial)shared.Duplicate();
++				var material = Engine_UiSceneBuilder.CopyMaterial(shared);
+ 				Vector2 offset = material.GetShaderParameter("uv1_offset").AsVector2();
+ 				float inset = offset.X - (Mathf.Floor((offset.X * 4f) + 0.01f) * 0.25f);
+ 				material.SetShaderParameter("uv1_offset", new Vector2((column * 0.25f) + inset, offset.Y));
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiTheme.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiTheme.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiTheme.cs	2026-10-24 03:58:02.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiTheme.cs	2026-11-01 19:44:32.115321900 -0400
+@@ -205,7 +205,7 @@
+ 	{
+ 		if (node is MeshInstance3D mesh && mesh.MaterialOverride is ShaderMaterial shared)
+ 		{
+-			mesh.MaterialOverride = (ShaderMaterial)shared.Duplicate();
++			mesh.MaterialOverride = Engine_UiSceneBuilder.CopyMaterial(shared);
+ 		}
+ 
+ 		foreach (Node child in node.GetChildren())
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/Engine/ui/Engine_UiTrace.cs refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiTrace.cs
+--- refii_build_orig/sdk/src/Engine/ui/Engine_UiTrace.cs	1969-12-31 20:00:00.000000000 -0400
++++ refii_ui_11_hover/sdk/src/Engine/ui/Engine_UiTrace.cs	2026-11-01 19:44:31.944774000 -0400
+@@ -0,0 +1,18 @@
++namespace Refii.Ui;
++
++/// <summary>
++/// Whether the UI's high-frequency traces are on. OFF by default: during play they repeat on
++/// every menu step, and each line is a synchronous write to the log file, which showed up as
++/// 25-214 ms frames inside the menus. Set <c>REFII_UI_TRACE=1</c> in the environment before
++/// launching to bring every line back for an investigation.
++/// </summary>
++/// <remarks>
++/// Only repetition is gated. State changes, failures, start-up, loading, warnings and errors
++/// are logged either way.
++/// </remarks>
++public static class Engine_UiTrace
++{
++	/// <summary>True when <c>REFII_UI_TRACE=1</c>: log every repeat as well as every change.</summary>
++	public static readonly bool Verbose =
++		System.Environment.GetEnvironmentVariable("REFII_UI_TRACE") == "1";
++}
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/game/GameInput.cs refii_ui_11_hover/sdk/src/game/GameInput.cs
+--- refii_build_orig/sdk/src/game/GameInput.cs	2026-10-24 03:58:02.000000000 -0400
++++ refii_ui_11_hover/sdk/src/game/GameInput.cs	2026-11-01 19:44:30.845477200 -0400
+@@ -1187,13 +1187,72 @@
+ 	/// </summary>
+ 	private static void PublishHolds(uint buttons)
+ 	{
+-		bool wheel = (buttons & Back) != 0;
++		bool raw = (buttons & Back) != 0;
++		bool wheel = raw;
++		if (WheelToggle)
++		{
++			// U09: a press opens the wheel and the next press closes it; nothing has to be
++			// held. The rest of the host sees the latch as the hold it replaces, so the
++			// guest's open/close/select levers and the free cursor work unchanged.
++			if (raw && !_wheelRawWasDown)
++			{
++				_wheelLatched = !_wheelLatched;
++			}
++
++			if (_wheelUnlatch)
++			{
++				_wheelUnlatch = false;
++				_wheelLatched = false;
++			}
++
++			wheel = _wheelLatched;
++		}
++
++		_wheelRawWasDown = raw;
+ 		QuickWheelPressed = wheel && !_wheelWasDown;
+ 		QuickWheelReleased = !wheel && _wheelWasDown;
+ 		QuickWheelHeld = wheel;
+ 		_wheelWasDown = wheel;
+ 	}
+ 
++	private static bool _wheelRawWasDown;
++	private static bool _wheelLatched;
++	private static bool _wheelUnlatch;
++	private static int _wheelToggle = -1;
++
++	/// <summary>
++	/// U09: the expression wheel opens on a press and stays open until the next press (or until
++	/// the game closes it itself). <c>refii_wheel_hold.flag</c> beside the exe restores the
++	/// shipped hold-to-open.
++	/// </summary>
++	public static bool WheelToggle
++	{
++		get
++		{
++			if (_wheelToggle < 0)
++			{
++				bool hold = false;
++				try
++				{
++					string dir = System.IO.Path.GetDirectoryName(Godot.OS.GetExecutablePath()) ?? "";
++					hold = System.IO.File.Exists(System.IO.Path.Combine(dir, "refii_wheel_hold.flag"));
++				}
++				catch (System.Exception)
++				{
++					hold = false;
++				}
++
++				_wheelToggle = hold ? 0 : 1;
++				Godot.GD.Print($"[ui-u09] expression wheel: {(hold ? "hold (refii_wheel_hold.flag)" : "toggle (press Q to open, Q again to close)")}");
++			}
++
++			return _wheelToggle == 1;
++		}
++	}
++
++	/// <summary>The game closed the wheel itself (an expression started): drop the latch.</summary>
++	public static void WheelClosedByGame() => _wheelUnlatch = true;
++
+ 	/// <summary>
+ 	/// Local player two's expression-wheel levers, edge-detected off their own pad: Back holds
+ 	/// the wheel, A selects (its release ends a held expression), B backs out, the left stick
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/game/GameUi.cs refii_ui_11_hover/sdk/src/game/GameUi.cs
+--- refii_build_orig/sdk/src/game/GameUi.cs	2026-10-24 03:58:02.000000000 -0400
++++ refii_ui_11_hover/sdk/src/game/GameUi.cs	2026-11-01 19:58:29.068538100 -0400
+@@ -1,4 +1,4 @@
+-using System.Linq;
++﻿using System.Linq;
+ using Godot;
+ using Refii.Core;
+ using Refii.Ui;
+@@ -120,6 +120,9 @@
+ 
+ 	private int _menuModelReported;
+ 
++	/// <summary>The menu model's last logged shape (its description minus the statement count).</summary>
++	private string? _menuModelShapeReported;
++
+ 	/// <summary>What the `g_Menu` capture had recorded/dropped when it was last reported.</summary>
+ 	private ulong _menuChunksRecorded = ulong.MaxValue;
+ 
+@@ -4818,6 +4821,13 @@
+ 			}
+ 		}
+ 
++		// U09: a latched wheel with no HUD to show it (a cutscene, a loading screen) is let go,
++		// so the cursor never stays freed from the camera.
++		if (GameInput.WheelToggle && GameInput.QuickWheelHeld && !(hudValid && _hudScreen is not null))
++		{
++			GameInput.WheelClosedByGame();
++		}
++
+ 		if (hudValid && _hudScreen is not null)
+ 		{
+ 			// THE EXPRESSION WHEEL, through the guest's own open/close/select — the
+@@ -4829,6 +4839,9 @@
+ 			{
+ 				HostBridge.PostFrontEndAction("QuickWheel:open");
+ 				_wheelSector = -1;
++				_wheelSeenOpen = false;
++				_wheelHiddenFrames = 0;
++				_wheelPointerLogged = false;
+ 			}
+ 			else if (GameInput.QuickWheelReleased)
+ 			{
+@@ -4859,13 +4872,42 @@
+ 				// dead ring of a third of the wheel, is the same direction the stick
+ 				// would hold. Left press selects, its release ends a held expression.
+ 				Vector2 stick = GameInput.LeftStick;
+-				if (Engine_UiPointer.Canvas is { } wheelAt &&
+-					Engine_UiTheme.FindByName(_hud!, "ExpressionWheel") is Node3D wheelNode &&
+-					Engine_UiPointer.CanvasBounds(wheelNode) is { } wheelBox)
+-				{
+-					Vector2 offset = wheelAt - wheelBox.GetCenter();
+-					float radius = Mathf.Min(wheelBox.Size.X, wheelBox.Size.Y) * 0.5f;
+-					if (radius > 0f && offset.Length() > radius / 3f)
++
++				// U09: with the toggle, nothing releases the key when the game itself closes
++				// the wheel (an expression started), so the latch follows the wheel's art: once
++				// it has been shown, a wheel hidden for a few frames running is a closed one.
++				Rect2? wheelBounds = WheelCanvasBounds(out int wheelPieces);
++				if (GameInput.WheelToggle)
++				{
++					if (wheelPieces > 0)
++					{
++						_wheelSeenOpen = true;
++						_wheelHiddenFrames = 0;
++					}
++					else if (_wheelSeenOpen && ++_wheelHiddenFrames >= 15)
++					{
++						_wheelSeenOpen = false;
++						GD.Print("[ui-u09] the game closed the wheel: latch released");
++						GameInput.WheelClosedByGame();
++					}
++				}
++
++				if (!_wheelPointerLogged && wheelPieces > 0)
++				{
++					_wheelPointerLogged = true;
++					GD.Print($"[ui-u09] wheel open: pointer={(Engine_UiPointer.Canvas is { } at ? at.ToString() : "none")} " +
++						$"free={Engine_UiPointer.Free} pieces={wheelPieces} box={(wheelBounds is { } bx ? bx.ToString() : "none")}");
++				}
++
++				// U09c: the wheel is drawn at the window's centre; the pointer's offset from it in
++				// window pixels (Y down, as the stick) is the direction. The pieces' canvas box is
++				// off-centre and was the miscalibration.
++				if (Engine_UiPointer.Canvas is not null && wheelBounds is not null && GetViewport() is { } wheelPort)
++				{
++					Vector2 portSize = wheelPort.GetVisibleRect().Size;
++					Vector2 offset = wheelPort.GetMousePosition() - (portSize * 0.5f);
++					float dead = Mathf.Min(portSize.X, portSize.Y) * 0.06f;
++					if (dead > 0f && offset.Length() > dead)
+ 					{
+ 						stick = offset.Normalized();
+ 					}
+@@ -4902,6 +4944,11 @@
+ 					if (best != _wheelSector)
+ 					{
+ 						_wheelSector = best;
++						if (GameInput.WheelToggle)
++						{
++							GD.Print($"[ui-u09] sector {best} stick={stick}");
++						}
++
+ 						HostBridge.PostFrontEndAction($"QuickWheel:point:{best}");
+ 					}
+ 				}
+@@ -6797,6 +6844,7 @@
+ 		{
+ 			// The pointer first, so every screen below reads the same position this frame.
+ 			Engine_UiPointer.Resolve(_uiCamera, _viewport, GetViewport().GetVisibleRect().Size);
++			Engine_UiCursor.Apply(DisplayServer.WindowGetSize().Y);
+ 
+ 			GameInput.CoopScreenOwnsInput = OwnedScreenId() == CoopScreenId;
+ 			PointerCoop();
+@@ -6832,6 +6880,16 @@
+ 			return false;
+ 		}
+ 
++		// U08: Home / End jump to the first / last row — the scroll bar's own path (our cursor
++		// walks there a step a frame; the guest's is sent the pad steps).
++		if (Engine_UiInputMode.KeyboardMouse && view.Menu is not null && Engine_UiPointer.TakeJump() is int jump and not 0)
++		{
++			_clickView = null;
++			_clickItem = null;
++			BarTo(view, jump < 0 ? 0f : 1f, grab: true);
++			GD.Print($"[ui-u11] {(jump < 0 ? "Home" : "End")} on list {view.Name}");
++		}
++
+ 		if (Engine_UiPointer.Canvas is not { } at)
+ 		{
+ 			// The pad took over: a click still waiting is dropped, never answered later.
+@@ -6841,6 +6899,25 @@
+ 				_clickItem = null;
+ 			}
+ 
++			view.Hover = null;
++			BackPromptHover(null, false);
++			return false;
++		}
++
++		// U11 / V4: the "Esc Back" prompt of the page lights under the mouse and a click on it is B.
++		bool onBack = BackPromptAt(view, at);
++		BackPromptHover(view, onBack);
++		if (onBack)
++		{
++			view.Hover = null;
++			if (Engine_UiPointer.TakeLeft())
++			{
++				_clickView = null;
++				_clickItem = null;
++				GameInput.QueuePointerButtons(true, 0);
++				GD.Print("[ui-u11] click on the Back prompt -> B");
++			}
++
+ 			return false;
+ 		}
+ 
+@@ -6848,6 +6925,7 @@
+ 		// drag keeps sending it for as long as the button is held, wherever the pointer wanders.
+ 		if (ReferenceEquals(_barDrag, view))
+ 		{
++			view.Hover = null;
+ 			if (Input.IsMouseButtonPressed(MouseButton.Left))
+ 			{
+ 				BarTo(view, view.ScrollBarPositionAt(at), grab: false);
+@@ -6859,6 +6937,7 @@
+ 
+ 		if (view.ScrollBarAt(at) is { } barPosition)
+ 		{
++			view.Hover = null;
+ 			if (Engine_UiPointer.TakeLeft())
+ 			{
+ 				_barDrag = view;
+@@ -6875,11 +6954,33 @@
+ 		// the detail page's, to scroll and to turn the preview.
+ 		if (view.GlobalPosition.X < 0f && at.X >= 0f)
+ 		{
++			view.Hover = null;
+ 			return ClickDue(view);
+ 		}
+ 
+ 		Engine_UiExpandableMenu.Item? item = view.EntryAt(at);
+ 
++		// U11 / V2: the hover mark follows the mouse only while the MOUSE is what moved last:
++		// arrows or the wheel sliding the carousel under a resting pointer drop it until the
++		// mouse moves again, so it never marks a row the player did not point at.
++		int highlightIdx = view.Menu?.Model.CurrentHighlightIdx ?? 0;
++		if (!ReferenceEquals(_hoverView, view))
++		{
++			_hoverView = view;
++			_hoverArmed = Engine_UiPointer.Moved;
++		}
++		else if (Engine_UiPointer.Moved)
++		{
++			_hoverArmed = true;
++		}
++		else if (highlightIdx != _hoverLastIdx)
++		{
++			_hoverArmed = false;
++		}
++
++		_hoverLastIdx = highlightIdx;
++		view.Hover = _hoverArmed ? item : null;
++
+ 		// The wheel over the list's column — on a row or between them — is the pad's D-pad step,
+ 		// handed to it here so nothing else this frame claims a notch that landed on the list.
+ 		// The pad clamps at the ends exactly as it does for the stick.
+@@ -7009,10 +7110,277 @@
+ 
+ 	/// <summary>The left button went down on the expression wheel and has not come up.</summary>
+ 	private bool _wheelMouseDown;
++	private bool _wheelSeenOpen;
++	private int _wheelHiddenFrames;
++	private bool _wheelPointerLogged;
++
++	/// <summary>
++	/// U09: the expression wheel on the canvas, the union of its drawn pieces. The HUD cuts the
++	/// wheel (`Layer/wheelmenu`) into pieces named by id, `group.ExpressionWheel.*`; no node is
++	/// named ExpressionWheel, which is why the pointer never reached the wheel before.
++	/// </summary>
++	private Rect2? WheelCanvasBounds(out int pieces)
++	{
++		pieces = 0;
++		if (_hud is null || !GodotObject.IsInstanceValid(_hud))
++		{
++			return null;
++		}
++
++		Rect2? union = null;
++		foreach ((string id, Node3D node) in _hud.DrawnPieces())
++		{
++			if (!id.StartsWith("group.ExpressionWheel", System.StringComparison.Ordinal))
++			{
++				continue;
++			}
++
++			if (Engine_UiPointer.CanvasBounds(node) is { } box)
++			{
++				pieces++;
++				union = union is { } u ? u.Merge(box) : box;
++			}
++		}
++
++		return union;
++	}
+ 
+ 	/// <summary>The list whose scroll bar the left button is dragging, or null.</summary>
+ 	private static Engine_FrontEndMenuView? _barDrag;
+ 
++	// ---- U11 / V2: the list hover mark only while the mouse moved last ----
++	private static Engine_FrontEndMenuView? _hoverView;
++	private static bool _hoverArmed;
++	private static int _hoverLastIdx = -1;
++
++	// ---- U11 / V4: the page's "Esc Back" prompt answers the mouse ----
++
++	/// <summary>A view's back prompt: the B glyph and the word beside it.</summary>
++	private sealed class BackPrompt
++	{
++		public MeshInstance3D? Glyph;
++		public MeshInstance3D? Label;
++		public ulong RetryFrame;
++		public bool Logged;
++	}
++
++	private static readonly System.Collections.Generic.Dictionary<ulong, BackPrompt> _backPrompts = new();
++
++	/// <summary>The prompt lit now, and what it looked like before.</summary>
++	private static BackPrompt? _backLit;
++	private static Color _backLitColour;
++	private static Vector3 _backLitScale;
++
++	private const float BackGlyphHoverScale = 1.12f;
++
++	/// <summary>Whether the canvas point is on the view's drawn back prompt (glyph + word).</summary>
++	private static bool BackPromptAt(Engine_FrontEndMenuView view, Vector2 at)
++	{
++		if (!Engine_FrontEndMenuView.HoverEnabled || BackPromptFor(view) is not { Glyph: { } glyph } prompt ||
++			!glyph.IsVisibleInTree() || Engine_UiPointer.CanvasBounds(glyph) is not { } box)
++		{
++			return false;
++		}
++
++		if (prompt.Label is { } label && GodotObject.IsInstanceValid(label) && label.IsVisibleInTree() &&
++			Engine_UiPointer.CanvasBounds(label) is { } words)
++		{
++			box = box.Merge(words);
++		}
++
++		return box.Grow(6f).HasPoint(at);
++	}
++
++	/// <summary>
++	/// The view's back prompt, found once by climbing its ancestors to the nearest one that holds
++	/// a drawn <c>icon_button_b</c>; retried every half second while the page has none drawn.
++	/// </summary>
++	private static BackPrompt? BackPromptFor(Engine_FrontEndMenuView view)
++	{
++		ulong id = view.GetInstanceId();
++		if (!_backPrompts.TryGetValue(id, out BackPrompt? prompt))
++		{
++			prompt = new BackPrompt();
++			_backPrompts[id] = prompt;
++		}
++
++		if (prompt.Glyph is { } held && GodotObject.IsInstanceValid(held) && held.IsInsideTree())
++		{
++			return prompt;
++		}
++
++		prompt.Glyph = null;
++		prompt.Label = null;
++		ulong frame = Engine.GetProcessFrames();
++		if (frame < prompt.RetryFrame)
++		{
++			return null;
++		}
++
++		prompt.RetryFrame = frame + 30;
++		Node? level = view;
++		for (int up = 0; up < 7 && level is not null; ++up, level = level.GetParent())
++		{
++			if (FindDrawn(level, "icon_button_b") is not { } glyph)
++			{
++				continue;
++			}
++
++			prompt.Glyph = glyph;
++			prompt.Label = NearestLabel(glyph);
++			if (!prompt.Logged)
++			{
++				prompt.Logged = true;
++				// The band's other pieces, to see whether a tabbed page draws LB/RB (V4 legend).
++				var band = new System.Collections.Generic.List<string>();
++				if (glyph.GetParent() is { } parent)
++				{
++					for (int i = 0, count = parent.GetChildCount(); i < count; ++i)
++					{
++						if (parent.GetChild(i) is Node3D { Visible: true } piece)
++						{
++							band.Add(piece.Name);
++						}
++					}
++				}
++
++				GD.Print($"[ui-u11] back prompt found for {view.Name}: {glyph.GetPath()} " +
++					$"(word: {(prompt.Label is null ? "none" : prompt.Label.Name)}; band: {string.Join(", ", band)})");
++			}
++
++			return prompt;
++		}
++
++		if (!prompt.Logged)
++		{
++			prompt.Logged = true;
++			GD.Print($"[ui-u11] back prompt not found for {view.Name} ({view.GetPath()})");
++		}
++
++		return null;
++	}
++
++	/// <summary>The first visible, drawn mesh of that name under the node.</summary>
++	private static MeshInstance3D? FindDrawn(Node node, string name)
++	{
++		if (node is Node3D { Visible: false })
++		{
++			return null;
++		}
++
++		if (node is MeshInstance3D mesh && mesh.Name == name && Engine_UiPointer.CanvasBounds(mesh) is not null)
++		{
++			return mesh;
++		}
++
++		for (int i = 0, count = node.GetChildCount(); i < count; ++i)
++		{
++			if (FindDrawn(node.GetChild(i), name) is { } found)
++			{
++				return found;
++			}
++		}
++
++		return null;
++	}
++
++	/// <summary>The text label beside the glyph in its band: on its row, nearest on its right.</summary>
++	private static MeshInstance3D? NearestLabel(MeshInstance3D glyph)
++	{
++		if (glyph.GetParent() is not { } band || Engine_UiPointer.CanvasBounds(glyph) is not { } at)
++		{
++			return null;
++		}
++
++		MeshInstance3D? best = null;
++		float bestGap = float.MaxValue;
++		for (int i = 0, count = band.GetChildCount(); i < count; ++i)
++		{
++			if (band.GetChild(i) is not MeshInstance3D label || ReferenceEquals(label, glyph) ||
++				!label.Visible || !Engine_UiSceneBuilder.IsLabel(label) ||
++				Engine_UiPointer.CanvasBounds(label) is not { } box)
++			{
++				continue;
++			}
++
++			float midY = box.GetCenter().Y;
++			if (midY < at.Position.Y - at.Size.Y || midY > at.End.Y + at.Size.Y)
++			{
++				continue;
++			}
++
++			float gap = box.Position.X - at.End.X;
++			if (gap < -at.Size.X || gap > 400f)
++			{
++				continue;
++			}
++
++			gap = Mathf.Abs(gap);
++			if (gap < bestGap)
++			{
++				bestGap = gap;
++				best = label;
++			}
++		}
++
++		return best;
++	}
++
++	/// <summary>Lights the view's back prompt while the mouse is on it; puts it back when it leaves.</summary>
++	private static void BackPromptHover(Engine_FrontEndMenuView? view, bool on)
++	{
++		BackPrompt? mine = view is not null && _backPrompts.TryGetValue(view.GetInstanceId(), out BackPrompt? p) ? p : null;
++		BackPrompt? want = on ? mine : null;
++
++		// Another list asked this frame with the mouse off its own prompt: the lit one is not its to put out.
++		if (!on && view is not null && _backLit is not null && !ReferenceEquals(mine, _backLit))
++		{
++			return;
++		}
++
++		if (!ReferenceEquals(want, _backLit))
++		{
++			UnlightBack();
++			if (want is { Glyph: { } glyph })
++			{
++				_backLit = want;
++				_backLitScale = glyph.Scale;
++				_backLitColour = want.Label is { } label ? Engine_UiSceneBuilder.TextColour(label) : Colors.White;
++				glyph.Scale = _backLitScale * BackGlyphHoverScale;
++			}
++		}
++
++		// Every frame while lit, so a fade the page runs on the word keeps its own alpha.
++		if (_backLit is { Label: { } lit } && GodotObject.IsInstanceValid(lit))
++		{
++			Color now = Engine_UiSceneBuilder.TextColour(lit);
++			Color hover = Engine_FrontEndMenuView.HoverLabelColour;
++			Engine_UiSceneBuilder.SetTextColour(lit, new Color(hover.R, hover.G, hover.B, now.A));
++		}
++	}
++
++	private static void UnlightBack()
++	{
++		if (_backLit is null)
++		{
++			return;
++		}
++
++		if (_backLit.Glyph is { } glyph && GodotObject.IsInstanceValid(glyph))
++		{
++			glyph.Scale = _backLitScale;
++		}
++
++		if (_backLit.Label is { } label && GodotObject.IsInstanceValid(label))
++		{
++			float alpha = Engine_UiSceneBuilder.TextColour(label).A;
++			Engine_UiSceneBuilder.SetTextColour(label,
++				new Color(_backLitColour.R, _backLitColour.G, _backLitColour.B, alpha));
++		}
++
++		_backLit = null;
++	}
++
+ 	/// <summary>
+ 	/// The mouse on a book's right-hand page: the wheel over its scroll region scrolls it, and its
+ 	/// authored scroll bar jumps on a press and drags while the button is held.
+@@ -7456,7 +7824,18 @@
+ 		if (_menuModel.Applied != _menuModelReported)
+ 		{
+ 			_menuModelReported = _menuModel.Applied;
+-			GD.Print($"[menu-model] {_menuModel.Describe()}");
++
++			// ONLY A CHANGE OF SHAPE IS NEWS. Every highlight step is a statement, and logging
++			// the whole description on each one wrote a line per keypress (3,500 a session)
++			// with only the counter moving. REFII_UI_TRACE=1 logs every one again.
++			string described = _menuModel.Describe();
++			int shapeAt = described.IndexOf(" | ", System.StringComparison.Ordinal);
++			string shape = shapeAt < 0 ? string.Empty : described[(shapeAt + 3)..];
++			if (Engine_UiTrace.Verbose || shape != _menuModelShapeReported)
++			{
++				_menuModelShapeReported = shape;
++				GD.Print($"[menu-model] {described}");
++			}
+ 		}
+ 
+ 		// WHAT THE CAPTURE ITSELF HAS SEEN, whenever it moves. Without this, "the guest states
+@@ -7468,10 +7847,17 @@
+ 			: (_menuChunksRecorded, 0u, _menuChunksDropped);
+ 		if (recorded != _menuChunksRecorded || dropped != _menuChunksDropped)
+ 		{
++			// The first statement proves the hook fires, and a drop or a restart is a failure:
++			// those are always logged. The climb in between only with REFII_UI_TRACE=1.
++			bool captureNews = Engine_UiTrace.Verbose || _menuChunksRecorded == 0 ||
++				recorded < _menuChunksRecorded || dropped != _menuChunksDropped;
+ 			_menuChunksRecorded = recorded;
+ 			_menuChunksDropped = dropped;
+-			GD.Print($"[menu-model] the g_Menu capture has recorded {recorded} statement(s), " +
+-				$"{pending} pending, {dropped} dropped — applied {_menuModel.Applied}");
++			if (captureNews)
++			{
++				GD.Print($"[menu-model] the g_Menu capture has recorded {recorded} statement(s), " +
++					$"{pending} pending, {dropped} dropped — applied {_menuModel.Applied}");
++			}
+ 		}
+ 		TellExitRefused();
+ 		_boxes.Tick(delta);
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/game/GameWindow.cs refii_ui_11_hover/sdk/src/game/GameWindow.cs
+--- refii_build_orig/sdk/src/game/GameWindow.cs	2026-10-24 03:58:02.000000000 -0400
++++ refii_ui_11_hover/sdk/src/game/GameWindow.cs	2026-11-01 19:44:30.816471400 -0400
+@@ -404,6 +404,7 @@
+ 			HostEntityWalk.Kick();
+ 		}
+ 		TraceFrontEnd();
++		WarmItemIndex();
+ 		StepShots();
+ 		ResolveMovieConceal();
+ 
+@@ -540,9 +541,11 @@
+ 			? $"{ls.Manager:X8}/{ls.Screen:X8}/{ls.Fade:F1}/{ls.Requested}/{ls.Done}"
+ 			: "none";
+ 		string ringKey = string.Empty;
++		bool ringBlocks = false;
+ 		foreach (HostBridge.SceneStream s in HostBridge.GetSceneStreams())
+ 		{
+ 			ringKey += $"{s.WriteCursor:X}:{s.ReaderConsumed:X};";
++			ringBlocks |= s.WouldBlock(4u);
+ 		}
+ 		HostBridge.InitMarkers markers = HostBridge.GetInitMarkers();
+ 
+@@ -553,7 +556,11 @@
+ 		bool steadyInGame = inGame && !fence.BlocksLevelLoad && !fence.Busy && loadingKey == "none";
+ 		string fenceProgress = steadyInGame ? "steady" : $"{fence.Submitted:F1}";
+ 		string simProgress = steadyInGame ? "steady" : $"{(int)pacer.SimTime}";
+-		string signature = $"{fence.Busy}/{fence.BlocksLevelLoad}/{fenceProgress}|{loadingKey}|{ringKey}|" +
++		// The scene-stream cursors move on every guest frame; in steady play that is traffic, not
++		// a state change, and re-logged all four lines whenever a menu opened. A ring that would
++		// block is still news, and REFII_UI_TRACE=1 restores the cursor-by-cursor trace.
++		string ringProgress = steadyInGame && !ringBlocks && !Engine_UiTrace.Verbose ? "steady" : ringKey;
++		string signature = $"{fence.Busy}/{fence.BlocksLevelLoad}/{fenceProgress}|{loadingKey}|{ringProgress}|" +
+ 			$"{markers.GdbManager:X8}/{markers.InGame}/{markers.GameMode:X8}/{markers.FrontEndMode:X8}|" +
+ 			$"{pacer.Known}/{simProgress}/{pacer.SimulationGate}/{pacer.WorldGate}";
+ 		if (signature == _lastLoadTrace)
+@@ -638,6 +645,35 @@
+ 	private int _fenceTicks;
+ 	private string _lastLoadTrace = string.Empty;
+ 
++	/// <summary>D3c: the database the item books' name-tag index was warmed for.</summary>
++	private Refii.Gdb.GdbMulti? _itemIndexWarmedFor;
++	private int _itemIndexTicks;
++
++	/// <summary>
++	/// D3c: builds the item books' name-tag index while a loading screen is up, so the first
++	/// item book of a session does not pay for it on the frame it opens. Polled every 30th
++	/// frame; it waits for the database and never builds it.
++	/// </summary>
++	private void WarmItemIndex()
++	{
++		if (++_itemIndexTicks % 30 != 0 || HostBridge.TryGetAbiVersion() is null ||
++			HostBridge.GetLoadingScreen() is null ||
++			Refii.Gdb.Engine_GameGdb.DatabaseIfBuilt is not { } multi ||
++			ReferenceEquals(multi, _itemIndexWarmedFor))
++		{
++			return;
++		}
++
++		_itemIndexWarmedFor = multi;
++		long started = System.Diagnostics.Stopwatch.GetTimestamp();
++		int tags = Engine_UiItemPage.WarmNameTagIndex(multi);
++		double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - started) * 1000.0 /
++			System.Diagnostics.Stopwatch.Frequency;
++		GD.Print(tags < 0
++			? "[item-page] name-tag index was already built (lazily, before a loading screen)"
++			: $"[item-page] name-tag index built during the loading screen: {tags} tag(s) in {ms:0} ms");
++	}
++
+ 	private void TraceFrontEnd()
+ 	{
+ 		TraceLevelLoad();
+diff -ruN --strip-trailing-cr refii_build_orig/sdk/src/game/GameWorld.cs refii_ui_11_hover/sdk/src/game/GameWorld.cs
+--- refii_build_orig/sdk/src/game/GameWorld.cs	2026-10-24 03:58:02.000000000 -0400
++++ refii_ui_11_hover/sdk/src/game/GameWorld.cs	2026-11-01 19:44:30.820472200 -0400
+@@ -505,6 +505,7 @@
+ 				$"mesh, reconciled its copies and drew {ReleaseSettleFrames} settled frame(s) after " +
+ 				$"{_propHoldFrames} frame(s) — releasing the guest; " +
+ 				(_entities?.DescribeHero() ?? "no entity feed"));
++			GD.Print(Refii.Level.Engine_PropFade.Summary());
+ 			CompactLargeObjectHeap();
+ 			Refii.Core.Engine_FramePhases.ResetMetrics();
+ 		}
